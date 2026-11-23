@@ -1775,6 +1775,34 @@ export async function allocateMaterialLotDb(
         Math.max(0, prevPool - prevQtyInLotUnit + qtyInLotUnit).toFixed(3)
       );
 
+      if (rawLot.status === 'Expired' || rawLot.status === 'Depleted') {
+        throw new ValidationError(
+          `Lot ${rawLot.lotNumber} is ${rawLot.status} and cannot be allocated.`
+        );
+      }
+
+      const [formulaForBom] = await tx
+        .select()
+        .from(formulas)
+        .where(and(eq(formulas.id, batch.formulaId), eq(formulas.ownerId, ownerId)));
+      const inBom = (formulaForBom?.ingredients || []).some(
+        (ing) => ing.materialCode === rawLot.materialCode
+      );
+      if (!inBom) {
+        throw new ValidationError(
+          `Material ${rawLot.materialCode} is not in the BOM for this batch's formula.`
+        );
+      }
+
+      // Stock already reserved by other batches (this batch's previous entry is being replaced).
+      const reservedElsewhere = Math.max(0, prevPool - prevQtyInLotUnit);
+      const freeQty = Number((rawLot.quantityAvailable - reservedElsewhere).toFixed(3));
+      if (qtyInLotUnit > freeQty + 1e-9) {
+        throw new ValidationError(
+          `Cannot allocate ${qtyInLotUnit} ${rawLot.unit} from lot ${rawLot.lotNumber}: only ${Math.max(0, freeQty)} ${rawLot.unit} is unreserved.`
+        );
+      }
+
       const nextAllocated = [
         ...prevAllocated.filter(
           (a) => !(a.materialCode === rawLot.materialCode && a.lotId === rawLot.id)
