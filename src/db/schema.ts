@@ -1,4 +1,4 @@
-import { relations } from 'drizzle-orm';
+import { relations, sql } from 'drizzle-orm';
 import {
   boolean,
   doublePrecision,
@@ -7,6 +7,7 @@ import {
   pgTable,
   text,
   timestamp,
+  uniqueIndex,
 } from 'drizzle-orm/pg-core';
 import type {
   AllocatedMaterialRecord,
@@ -214,7 +215,12 @@ export const batches = pgTable('batches', {
   finishedGoodId: text('finished_good_id').notNull().default(''),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
-});
+}, (t) => [
+  uniqueIndex('batches_owner_batch_number_uq').on(t.ownerId, t.batchNumber),
+  uniqueIndex('batches_owner_lot_number_uq')
+    .on(t.ownerId, t.lotNumber)
+    .where(sql`${t.lotNumber} <> ''`),
+]);
 
 export const finishedGoods = pgTable('finished_goods', {
   id: text('id').primaryKey(),

@@ -83,12 +83,19 @@ import type {
   WorkspaceSnapshot,
 } from '../types.ts';
 import {
+  areUnitsCompatible,
+  batchNumberPrefix,
   calculateBomAvailability,
   calculateExpiryDate,
   convertQuantity,
   deriveRawLotStatus,
   evaluateSensorStatus,
   generateBatchAndLotNumbers,
+  isLotExpired,
+  issuedFromLotInLotUnit,
+  lotNumberPrefix,
+  nextSequenceFor,
+  ownRemainingReservation,
 } from '../utils/units.ts';
 
 export interface ActorContext {
@@ -1237,18 +1244,8 @@ export async function createWorkOrderDb(
       .where(and(eq(formulas.id, input.formulaId), eq(formulas.ownerId, ownerId)));
     if (!formula) throw new ValidationError('Selected formula not found.');
 
-    const existingBatches = await db
-      .select({ id: batches.id })
-      .from(batches)
-      .where(eq(batches.ownerId, ownerId));
-
     const batchId = makeSafeId('bat');
     const plannedQty = Math.max(1, Number(input.plannedQty));
-    const { batchNumber } = generateBatchAndLotNumbers(
-      formula.sku,
-      input.lineName,
-      existingBatches.length
-    );
     const scaleFactor =
       formula.standardBatchSize > 0 ? plannedQty / formula.standardBatchSize : 1;
     const plannedDate = input.plannedDate.slice(0, 32);
@@ -1266,6 +1263,21 @@ export async function createWorkOrderDb(
         : [];
 
     await db.transaction(async (tx) => {
+      // Sequence from the highest existing number for today (not a row count); the unique
+      // index on (owner_id, batch_number) is the backstop for concurrent creates.
+      const todaysBatchNos = await tx
+        .select({ batchNumber: batches.batchNumber })
+        .from(batches)
+        .where(eq(batches.ownerId, ownerId));
+      const batchPrefix = batchNumberPrefix();
+      const { batchNumber } = generateBatchAndLotNumbers(
+        formula.sku,
+        input.lineName,
+        nextSequenceFor(
+          todaysBatchNos.map((b) => b.batchNumber),
+          batchPrefix
+        ) - 1
+      );
       await tx.insert(batches).values({
         id: batchId,
         ownerId,
@@ -1389,6 +1401,10 @@ export async function createWorkOrderDb(
   } catch (error) {
     console.error('Failed to create job order:', error);
     if (error instanceof ForbiddenError || error instanceof ValidationError) throw error;
+    if ((error as { code?: string; cause?: { code?: string } })?.code === '23505' ||
+        (error as { cause?: { code?: string } })?.cause?.code === '23505') {
+      throw new ValidationError('Another job order was created at the same moment. Please try again.');
+    }
     throw new Error('Unable to create production job order.', { cause: error });
   }
 }
@@ -1581,7 +1597,9 @@ export async function runAvailabilityCheckDb(
       const lines = calculateBomAvailability(
         formula as unknown as FormulaBOM,
         batch.plannedQty,
-        lots as unknown as RawMaterialLot[]
+        lots as unknown as RawMaterialLot[],
+        batch.allocatedMaterials || [],
+        batch.issuedMaterials || []
       );
       const shortageCount = lines.filter((l) => l.isShort).length;
 
@@ -1646,15 +1664,18 @@ export async function releaseWorkOrderDb(
         .where(and(eq(batches.id, batchId), eq(batches.ownerId, ownerId)));
       if (!batch) throw new ValidationError('Batch not found.');
 
-      const existingBatches = await tx
-        .select({ id: batches.id })
+      const existingLots = await tx
+        .select({ lotNumber: batches.lotNumber })
         .from(batches)
         .where(eq(batches.ownerId, ownerId));
 
       const { lotNumber } = generateBatchAndLotNumbers(
         batch.sku,
         batch.lineName,
-        existingBatches.length
+        nextSequenceFor(
+          existingLots.map((b) => b.lotNumber).filter(Boolean),
+          lotNumberPrefix()
+        ) - 1
       );
       const assignedLot = batch.lotNumber || lotNumber;
 
@@ -1737,6 +1758,11 @@ export async function allocateMaterialLotDb(
         .where(and(eq(rawMaterials.id, payload.rawLotId), eq(rawMaterials.ownerId, ownerId)));
       if (!rawLot) throw new ValidationError('Raw material lot not found.');
 
+      if (!areUnitsCompatible(payload.bomUnit, rawLot.unit as UnitOfMeasure)) {
+        throw new ValidationError(
+          `Unit mismatch: BOM unit ${payload.bomUnit} cannot be converted to lot unit ${rawLot.unit}.`
+        );
+      }
       const rawAllocQty = Number(payload.allocatedQtyInBomUnit);
       const qtyInLotUnit = convertQuantity(
         Number.isFinite(rawAllocQty) ? Math.max(0, rawAllocQty) : 0,
@@ -1763,21 +1789,11 @@ export async function allocateMaterialLotDb(
       const prevEntry = prevAllocated.find(
         (a) => a.materialCode === rawLot.materialCode && a.lotId === rawLot.id
       );
-      const prevQtyInLotUnit = prevEntry
-        ? convertQuantity(
-            Math.max(0, Number(prevEntry.allocatedQty) || 0),
-            prevEntry.unit as UnitOfMeasure,
-            rawLot.unit as UnitOfMeasure
-          )
-        : 0;
       const prevPool = Number((rawLot.quantityAllocated || 0).toFixed(3));
-      const nextPool = Number(
-        Math.max(0, prevPool - prevQtyInLotUnit + qtyInLotUnit).toFixed(3)
-      );
 
-      if (rawLot.status === 'Expired' || rawLot.status === 'Depleted') {
+      if (isLotExpired(rawLot) || rawLot.status === 'Depleted') {
         throw new ValidationError(
-          `Lot ${rawLot.lotNumber} is ${rawLot.status} and cannot be allocated.`
+          `Lot ${rawLot.lotNumber} is ${isLotExpired(rawLot) ? 'Expired' : 'Depleted'} and cannot be allocated.`
         );
       }
 
@@ -1794,14 +1810,27 @@ export async function allocateMaterialLotDb(
         );
       }
 
-      // Stock already reserved by other batches (this batch's previous entry is being replaced).
-      const reservedElsewhere = Math.max(0, prevPool - prevQtyInLotUnit);
+      // Stock reserved by OTHER batches. This batch's own remaining reservation is being replaced.
+      const alreadyIssuedFromLot = issuedFromLotInLotUnit(
+        batch.issuedMaterials || [],
+        rawLot.id,
+        rawLot.unit as UnitOfMeasure
+      );
+      const ownRemaining = ownRemainingReservation(
+        prevEntry ? [prevEntry] : [],
+        batch.issuedMaterials || [],
+        rawLot.id,
+        rawLot.unit as UnitOfMeasure
+      );
+      const reservedElsewhere = Math.max(0, prevPool - ownRemaining);
       const freeQty = Number((rawLot.quantityAvailable - reservedElsewhere).toFixed(3));
-      if (qtyInLotUnit > freeQty + 1e-9) {
+      const newRemaining = Math.max(0, qtyInLotUnit - alreadyIssuedFromLot);
+      if (newRemaining > freeQty + 1e-9) {
         throw new ValidationError(
           `Cannot allocate ${qtyInLotUnit} ${rawLot.unit} from lot ${rawLot.lotNumber}: only ${Math.max(0, freeQty)} ${rawLot.unit} is unreserved.`
         );
       }
+      const nextPool = Number((reservedElsewhere + newRemaining).toFixed(3));
 
       const nextAllocated = [
         ...prevAllocated.filter(
@@ -1931,6 +1960,40 @@ export async function issueMaterialLotDb(
         .where(and(eq(rawMaterials.id, payload.rawLotId), eq(rawMaterials.ownerId, ownerId)));
       if (!rawLot) throw new ValidationError('Raw material lot not found.');
 
+      // Required qty & tolerance come from the formula in the database, never from the client.
+      const [formulaForIssue] = await tx
+        .select()
+        .from(formulas)
+        .where(and(eq(formulas.id, batch.formulaId), eq(formulas.ownerId, ownerId)));
+      if (!formulaForIssue) throw new ValidationError('Formula not found.');
+      const bomLine = (formulaForIssue.ingredients || []).find(
+        (ing) => ing.materialCode === rawLot.materialCode
+      );
+      if (!bomLine) {
+        throw new ValidationError(
+          `Material ${rawLot.materialCode} is not in the BOM for this batch's formula.`
+        );
+      }
+      if (payload.bomUnit !== bomLine.unit) {
+        throw new ValidationError(
+          `Issue unit must match the BOM unit (${bomLine.unit}) for ${rawLot.materialCode}.`
+        );
+      }
+      if (!areUnitsCompatible(bomLine.unit as UnitOfMeasure, rawLot.unit as UnitOfMeasure)) {
+        throw new ValidationError(
+          `Unit mismatch: BOM unit ${bomLine.unit} cannot be converted to lot unit ${rawLot.unit}.`
+        );
+      }
+      if (isLotExpired(rawLot)) {
+        throw new ValidationError(`Lot ${rawLot.lotNumber} is Expired and cannot be issued.`);
+      }
+      const bomScale =
+        formulaForIssue.standardBatchSize > 0
+          ? batch.plannedQty / formulaForIssue.standardBatchSize
+          : 1;
+      const requiredQtyServer = Number((bomLine.quantityPerBatch * bomScale).toFixed(3));
+      const toleranceServer = Number(bomLine.tolerancePct) || 0;
+
       const rawActualQty = Number(payload.actualQtyInBomUnit);
       const deductQtyInLotUnit = convertQuantity(
         Number.isFinite(rawActualQty) ? Math.max(0, rawActualQty) : 0,
@@ -1939,6 +2002,25 @@ export async function issueMaterialLotDb(
       );
       if (!Number.isFinite(deductQtyInLotUnit) || deductQtyInLotUnit <= 0) {
         throw new ValidationError('Issued quantity must be greater than zero.');
+      }
+      if (deductQtyInLotUnit > rawLot.quantityAvailable + 1e-9) {
+        throw new ValidationError(
+          `Cannot issue ${deductQtyInLotUnit} ${rawLot.unit} from lot ${rawLot.lotNumber}: only ${rawLot.quantityAvailable} ${rawLot.unit} on hand.`
+        );
+      }
+      // Do not eat into stock reserved by other batches.
+      const ownRemainingRes = ownRemainingReservation(
+        batch.allocatedMaterials || [],
+        batch.issuedMaterials || [],
+        rawLot.id,
+        rawLot.unit as UnitOfMeasure
+      );
+      const reservedByOthers = Math.max(0, (rawLot.quantityAllocated || 0) - ownRemainingRes);
+      const issuableNow = Number((rawLot.quantityAvailable - reservedByOthers).toFixed(3));
+      if (deductQtyInLotUnit > issuableNow + 1e-9) {
+        throw new ValidationError(
+          `Cannot issue ${deductQtyInLotUnit} ${rawLot.unit} from lot ${rawLot.lotNumber}: only ${Math.max(0, issuableNow)} ${rawLot.unit} is not reserved by other batches.`
+        );
       }
       const nextAvailable = Number(
         Math.max(0, rawLot.quantityAvailable - deductQtyInLotUnit).toFixed(3)
@@ -1953,16 +2035,12 @@ export async function issueMaterialLotDb(
       );
 
       const variancePct =
-        payload.requiredQtyInBomUnit > 0
+        requiredQtyServer > 0
           ? Number(
-              (
-                ((payload.actualQtyInBomUnit - payload.requiredQtyInBomUnit) /
-                  payload.requiredQtyInBomUnit) *
-                100
-              ).toFixed(2)
+              (((rawActualQty - requiredQtyServer) / requiredQtyServer) * 100).toFixed(2)
             )
           : 0;
-      const withinTolerance = Math.abs(variancePct) <= payload.tolerancePct;
+      const withinTolerance = Math.abs(variancePct) <= toleranceServer;
       const cost = Number((deductQtyInLotUnit * rawLot.unitCost).toFixed(2));
       const nowStamp = new Date().toISOString().replace('T', ' ').slice(0, 16);
       const actorDisplayName = (payload.operatorName || effectiveActor.name).slice(0, 60);
@@ -1972,7 +2050,7 @@ export async function issueMaterialLotDb(
         materialName: rawLot.materialName,
         lotId: rawLot.id,
         lotNumber: rawLot.lotNumber,
-        requiredQty: payload.requiredQtyInBomUnit,
+        requiredQty: requiredQtyServer,
         actualQty: payload.actualQtyInBomUnit,
         unit: payload.bomUnit,
         variancePct,
@@ -1996,7 +2074,7 @@ export async function issueMaterialLotDb(
               materialName: rawLot.materialName,
               lotId: rawLot.id,
               lotNumber: rawLot.lotNumber,
-              allocatedQty: payload.requiredQtyInBomUnit,
+              allocatedQty: requiredQtyServer,
               unit: payload.bomUnit,
               allocatedBy: actorDisplayName,
               allocatedAt: nowStamp,
@@ -2167,6 +2245,40 @@ export async function updateIssuedMaterialLotDb(
         .where(and(eq(rawMaterials.id, payload.rawLotId), eq(rawMaterials.ownerId, ownerId)));
       if (!nextRawLot) throw new ValidationError('Target raw material lot not found.');
 
+      // Required qty & tolerance come from the formula in the database, never from the client.
+      const [formulaForEdit] = await tx
+        .select()
+        .from(formulas)
+        .where(and(eq(formulas.id, batch.formulaId), eq(formulas.ownerId, ownerId)));
+      if (!formulaForEdit) throw new ValidationError('Formula not found.');
+      const bomLineEdit = (formulaForEdit.ingredients || []).find(
+        (ing) => ing.materialCode === nextRawLot.materialCode
+      );
+      if (!bomLineEdit) {
+        throw new ValidationError(
+          `Material ${nextRawLot.materialCode} is not in the BOM for this batch's formula.`
+        );
+      }
+      if (payload.bomUnit !== bomLineEdit.unit) {
+        throw new ValidationError(
+          `Issue unit must match the BOM unit (${bomLineEdit.unit}) for ${nextRawLot.materialCode}.`
+        );
+      }
+      if (!areUnitsCompatible(bomLineEdit.unit as UnitOfMeasure, nextRawLot.unit as UnitOfMeasure)) {
+        throw new ValidationError(
+          `Unit mismatch: BOM unit ${bomLineEdit.unit} cannot be converted to lot unit ${nextRawLot.unit}.`
+        );
+      }
+      if (isLotExpired(nextRawLot)) {
+        throw new ValidationError(`Lot ${nextRawLot.lotNumber} is Expired and cannot be issued.`);
+      }
+      const editScale =
+        formulaForEdit.standardBatchSize > 0
+          ? batch.plannedQty / formulaForEdit.standardBatchSize
+          : 1;
+      const requiredQtyServer = Number((bomLineEdit.quantityPerBatch * editScale).toFixed(3));
+      const toleranceServer = Number(bomLineEdit.tolerancePct) || 0;
+
       const nextDeductInLotUnit = convertQuantity(
         rawActualQty,
         payload.bomUnit,
@@ -2174,6 +2286,11 @@ export async function updateIssuedMaterialLotDb(
       );
       if (!Number.isFinite(nextDeductInLotUnit) || nextDeductInLotUnit <= 0) {
         throw new ValidationError('Issued quantity must be greater than zero.');
+      }
+      if (nextDeductInLotUnit > nextRawLot.quantityAvailable + 1e-9) {
+        throw new ValidationError(
+          `Cannot issue ${nextDeductInLotUnit} ${nextRawLot.unit} from lot ${nextRawLot.lotNumber}: only ${nextRawLot.quantityAvailable} ${nextRawLot.unit} on hand.`
+        );
       }
       const nextAvailable = Number(
         Math.max(0, nextRawLot.quantityAvailable - nextDeductInLotUnit).toFixed(3)
@@ -2194,15 +2311,10 @@ export async function updateIssuedMaterialLotDb(
         .where(and(eq(rawMaterials.id, nextRawLot.id), eq(rawMaterials.ownerId, ownerId)));
 
       const variancePct =
-        payload.requiredQtyInBomUnit > 0
-          ? Number(
-              (
-                ((rawActualQty - payload.requiredQtyInBomUnit) / payload.requiredQtyInBomUnit) *
-                100
-              ).toFixed(2)
-            )
+        requiredQtyServer > 0
+          ? Number((((rawActualQty - requiredQtyServer) / requiredQtyServer) * 100).toFixed(2))
           : 0;
-      const withinTolerance = Math.abs(variancePct) <= payload.tolerancePct;
+      const withinTolerance = Math.abs(variancePct) <= toleranceServer;
       const cost = Number((nextDeductInLotUnit * nextRawLot.unitCost).toFixed(2));
       const nowStamp = new Date().toISOString().replace('T', ' ').slice(0, 16);
       const actorDisplayName = (payload.operatorName || effectiveActor.name).slice(0, 60);
@@ -2212,7 +2324,7 @@ export async function updateIssuedMaterialLotDb(
         materialName: nextRawLot.materialName,
         lotId: nextRawLot.id,
         lotNumber: nextRawLot.lotNumber,
-        requiredQty: payload.requiredQtyInBomUnit,
+        requiredQty: requiredQtyServer,
         actualQty: rawActualQty,
         unit: payload.bomUnit,
         variancePct,

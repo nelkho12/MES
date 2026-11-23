@@ -1,5 +1,7 @@
 import type {
+  AllocatedMaterialRecord,
   FormulaBOM,
+  IssuedMaterialRecord,
   ProductionBatch,
   RawMaterialLot,
   SensorStatus,
@@ -43,6 +45,101 @@ export function convertQuantity(
   return Number((baseQty / TO_BASE_FACTOR[to]).toFixed(4));
 }
 
+/**
+ * Like convertQuantity but throws when units are not convertible (e.g. kg -> pcs),
+ * instead of silently returning the unconverted number.
+ */
+export function convertQuantityStrict(
+  qty: number,
+  from: UnitOfMeasure,
+  to: UnitOfMeasure
+): number {
+  if (!areUnitsCompatible(from, to)) {
+    throw new Error(`Incompatible units: cannot convert ${from} to ${to}.`);
+  }
+  return convertQuantity(qty, from, to);
+}
+
+/** True when the lot is flagged Expired OR its expiry date has passed (stored status can be stale). */
+export function isLotExpired(lot: { status?: string; expiryDate: string }): boolean {
+  if (lot.status === 'Expired') return true;
+  const todayIso = new Date().toISOString().slice(0, 10);
+  return Boolean(lot.expiryDate) && lot.expiryDate < todayIso;
+}
+
+/** Quantity (in the lot's unit) that a batch has already issued from a given lot. */
+export function issuedFromLotInLotUnit(
+  issued: IssuedMaterialRecord[] | undefined,
+  lotId: string,
+  lotUnit: UnitOfMeasure
+): number {
+  return (issued || [])
+    .filter((m) => m.lotId === lotId && areUnitsCompatible(m.unit as UnitOfMeasure, lotUnit))
+    .reduce(
+      (sum, m) =>
+        sum + convertQuantity(Math.max(0, Number(m.actualQty) || 0), m.unit as UnitOfMeasure, lotUnit),
+      0
+    );
+}
+
+/**
+ * Remaining reservation (lot unit) that this batch still holds on a lot:
+ * what it allocated minus what it has already issued.
+ */
+export function ownRemainingReservation(
+  allocations: AllocatedMaterialRecord[] | undefined,
+  issued: IssuedMaterialRecord[] | undefined,
+  lotId: string,
+  lotUnit: UnitOfMeasure
+): number {
+  const alloc = (allocations || []).find((a) => a.lotId === lotId);
+  if (!alloc || !areUnitsCompatible(alloc.unit as UnitOfMeasure, lotUnit)) return 0;
+  const allocInLot = convertQuantity(
+    Math.max(0, Number(alloc.allocatedQty) || 0),
+    alloc.unit as UnitOfMeasure,
+    lotUnit
+  );
+  return Math.max(0, allocInLot - issuedFromLotInLotUnit(issued, lotId, lotUnit));
+}
+
+/**
+ * Next sequence number for identifiers shaped `<prefix><NNN>` (e.g. B-261123-007),
+ * based on the highest existing sequence instead of a row count, so deletions or
+ * other days' records never produce a repeat.
+ */
+export function nextSequenceFor(existingNumbers: string[], prefix: string): number {
+  let max = 0;
+  for (const n of existingNumbers) {
+    if (!n.startsWith(prefix)) continue;
+    const m = n.slice(prefix.length).match(/(\d+)$/);
+    if (m) max = Math.max(max, parseInt(m[1], 10));
+  }
+  return max + 1;
+}
+
+export function batchNumberPrefix(date = new Date()): string {
+  const { yy, mm, dd } = plantDateParts(date);
+  return `B-${yy}${mm}${dd}-`;
+}
+
+export function lotNumberPrefix(date = new Date()): string {
+  const { yy, mm, dd } = plantDateParts(date);
+  return `LOT-${yy}${mm}${dd}-`;
+}
+
+function plantDateParts(date: Date): { yy: string; mm: string; dd: string } {
+  const tz =
+    (typeof process !== 'undefined' && process.env?.PLANT_TIMEZONE) || 'Asia/Kuala_Lumpur';
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const get = (t: string) => parts.find((p) => p.type === t)?.value || '';
+  return { yy: get('year').slice(-2), mm: get('month'), dd: get('day') };
+}
+
 export interface AvailabilityLine {
   materialCode: string;
   materialName: string;
@@ -56,10 +153,27 @@ export interface AvailabilityLine {
   isShort: boolean;
 }
 
+/**
+ * Stock on a lot that is free for this batch: on-hand minus what OTHER batches
+ * have reserved (this batch's own remaining reservation stays usable).
+ */
+export function freeQtyOnLot(
+  lot: RawMaterialLot,
+  ownAllocations: AllocatedMaterialRecord[] = [],
+  ownIssued: IssuedMaterialRecord[] = []
+): number {
+  const pool = Math.max(0, Number(lot.quantityAllocated) || 0);
+  const own = ownRemainingReservation(ownAllocations, ownIssued, lot.id, lot.unit);
+  const reservedElsewhere = Math.max(0, pool - own);
+  return Math.max(0, Number((lot.quantityAvailable - reservedElsewhere).toFixed(4)));
+}
+
 export function calculateBomAvailability(
   formula: FormulaBOM,
   plannedQty: number,
-  rawMaterials: RawMaterialLot[]
+  rawMaterials: RawMaterialLot[],
+  ownAllocations: AllocatedMaterialRecord[] = [],
+  ownIssued: IssuedMaterialRecord[] = []
 ): AvailabilityLine[] {
   const scaleFactor =
     formula.standardBatchSize > 0 ? plannedQty / formula.standardBatchSize : 1;
@@ -70,9 +184,9 @@ export function calculateBomAvailability(
       .filter(
         (lot) =>
           lot.materialCode === ing.materialCode &&
-          lot.status !== 'Expired' &&
+          !isLotExpired(lot) &&
           lot.status !== 'Depleted' &&
-          lot.quantityAvailable > 0 &&
+          freeQtyOnLot(lot, ownAllocations, ownIssued) > 0 &&
           areUnitsCompatible(lot.unit, ing.unit)
       )
       .sort((a, b) => a.expiryDate.localeCompare(b.expiryDate)); // FEFO: First Expired, First Out
@@ -80,7 +194,8 @@ export function calculateBomAvailability(
     const availableQtyInBomUnit = Number(
       matchingLots
         .reduce(
-          (sum, lot) => sum + convertQuantity(lot.quantityAvailable, lot.unit, ing.unit),
+          (sum, lot) =>
+            sum + convertQuantity(freeQtyOnLot(lot, ownAllocations, ownIssued), lot.unit, ing.unit),
           0
         )
         .toFixed(3)
@@ -121,10 +236,7 @@ export function generateBatchAndLotNumbers(
   lineName: string,
   existingCount: number
 ): { batchNumber: string; lotNumber: string } {
-  const now = new Date();
-  const yy = String(now.getFullYear()).slice(-2);
-  const mm = String(now.getMonth() + 1).padStart(2, '0');
-  const dd = String(now.getDate()).padStart(2, '0');
+  const { yy, mm, dd } = plantDateParts(new Date());
   const seq = String(existingCount + 1).padStart(3, '0');
   const lineCode = lineName.replace(/[^A-Za-z0-9]/g, '').slice(0, 3).toUpperCase() || 'L1';
   const skuCode = sku.replace(/[^A-Za-z0-9]/g, '').slice(0, 4).toUpperCase();

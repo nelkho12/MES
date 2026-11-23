@@ -461,7 +461,9 @@ export function BatchesView({
     return calculateBomAvailability(
       selectedFormula,
       selectedBatch.plannedQty,
-      rawMaterials
+      rawMaterials,
+      selectedBatch.allocatedMaterials || [],
+      selectedBatch.issuedMaterials || []
     );
   }, [selectedBatch, selectedFormula, rawMaterials]);
 
