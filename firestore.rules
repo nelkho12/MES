@@ -1,0 +1,422 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Primitive Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerifiedUser() && request.auth.token.email == 'nelson.kho@mayralab.com';
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin() || (isVerifiedUser() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    function isValidString(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    }
+
+    // --- Validation Blueprints ---
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'displayName', 'role', 'plantName', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'role', 'plantName', 'createdAt', 'updatedAt'])
+        && data.uid == userId
+        && isValidId(data.uid)
+        && isValidString(data.displayName, 1, 100)
+        && data.role in ['manager', 'operator', 'qc']
+        && isValidString(data.plantName, 1, 120)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidFormulaBOM(data) {
+      return data.keys().hasAll([
+          'ownerId', 'sku', 'productName', 'packSize', 'shelfLifeDays',
+          'standardBatchSize', 'outputUnit', 'version', 'approvalStatus',
+          'isConfidentialOem', 'oemCustomer', 'laborCostPerBatch', 'overheadCostPerBatch',
+          'ingredients', 'routingSteps', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'sku', 'productName', 'packSize', 'shelfLifeDays',
+          'standardBatchSize', 'outputUnit', 'version', 'approvalStatus',
+          'isConfidentialOem', 'oemCustomer', 'laborCostPerBatch', 'overheadCostPerBatch',
+          'ingredients', 'routingSteps', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && isValidString(data.sku, 1, 40)
+        && isValidString(data.productName, 1, 120)
+        && isValidString(data.packSize, 1, 60)
+        && data.shelfLifeDays is number && data.shelfLifeDays >= 1 && data.shelfLifeDays <= 3650
+        && data.standardBatchSize is number && data.standardBatchSize > 0 && data.standardBatchSize <= 1000000
+        && isValidString(data.outputUnit, 1, 20)
+        && isValidString(data.version, 1, 24)
+        && data.approvalStatus in ['Draft', 'Approved', 'Archived']
+        && data.isConfidentialOem is bool
+        && isValidString(data.oemCustomer, 0, 100)
+        && data.laborCostPerBatch is number && data.laborCostPerBatch >= 0 && data.laborCostPerBatch <= 1000000
+        && data.overheadCostPerBatch is number && data.overheadCostPerBatch >= 0 && data.overheadCostPerBatch <= 1000000
+        && data.ingredients is list && data.ingredients.size() <= 30
+        && (data.ingredients.size() == 0 || data.ingredients[0] is map)
+        && data.routingSteps is list && data.routingSteps.size() <= 15
+        && (data.routingSteps.size() == 0 || data.routingSteps[0] is map)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidRawMaterialLot(data) {
+      return data.keys().hasAll([
+          'ownerId', 'lotNumber', 'materialCode', 'materialName', 'category',
+          'unit', 'quantityInitial', 'quantityAvailable', 'reorderLevel',
+          'unitCost', 'supplier', 'expiryDate', 'storageZone', 'status',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'lotNumber', 'materialCode', 'materialName', 'category',
+          'unit', 'quantityInitial', 'quantityAvailable', 'reorderLevel',
+          'unitCost', 'supplier', 'expiryDate', 'storageZone', 'status',
+          'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && isValidString(data.lotNumber, 1, 64)
+        && isValidString(data.materialCode, 1, 40)
+        && isValidString(data.materialName, 1, 120)
+        && data.category in ['Ingredient', 'Packaging']
+        && data.unit in ['kg', 'g', 'L', 'ml', 'pcs']
+        && data.quantityInitial is number && data.quantityInitial >= 0 && data.quantityInitial <= 10000000
+        && data.quantityAvailable is number && data.quantityAvailable >= 0 && data.quantityAvailable <= 10000000
+        && data.reorderLevel is number && data.reorderLevel >= 0 && data.reorderLevel <= 10000000
+        && data.unitCost is number && data.unitCost >= 0 && data.unitCost <= 1000000
+        && isValidString(data.supplier, 1, 100)
+        && isValidString(data.expiryDate, 1, 32)
+        && isValidString(data.storageZone, 1, 80)
+        && data.status in ['Available', 'Low', 'Depleted', 'Expired']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidProductionBatch(data) {
+      return data.keys().hasAll([
+          'ownerId', 'batchNumber', 'lotNumber', 'formulaId', 'formulaVersion',
+          'sku', 'productName', 'sourceType', 'sourceRef', 'plannedQty',
+          'outputUnit', 'plannedDate', 'lineName', 'assignedTeam', 'status',
+          'availabilityChecked', 'shortageCount', 'issuedMaterials', 'processChecks',
+          'goodQty', 'rejectedQty', 'sampleQty', 'reworkQty', 'wasteKg',
+          'yieldPct', 'variancePct', 'materialCost', 'laborCost', 'overheadCost',
+          'unitCost', 'qcStatus', 'qcNotes', 'qcInspector', 'postedToInventory',
+          'finishedGoodId', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'batchNumber', 'lotNumber', 'formulaId', 'formulaVersion',
+          'sku', 'productName', 'sourceType', 'sourceRef', 'plannedQty',
+          'outputUnit', 'plannedDate', 'lineName', 'assignedTeam', 'status',
+          'availabilityChecked', 'shortageCount', 'issuedMaterials', 'processChecks',
+          'goodQty', 'rejectedQty', 'sampleQty', 'reworkQty', 'wasteKg',
+          'yieldPct', 'variancePct', 'materialCost', 'laborCost', 'overheadCost',
+          'unitCost', 'qcStatus', 'qcNotes', 'qcInspector', 'postedToInventory',
+          'finishedGoodId', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && isValidString(data.batchNumber, 1, 64)
+        && isValidString(data.lotNumber, 0, 64)
+        && isValidId(data.formulaId)
+        && isValidString(data.formulaVersion, 1, 24)
+        && isValidString(data.sku, 1, 40)
+        && isValidString(data.productName, 1, 120)
+        && data.sourceType in ['Sales Demand', 'Low Stock Alert', 'OEM Request']
+        && isValidString(data.sourceRef, 0, 80)
+        && data.plannedQty is number && data.plannedQty > 0 && data.plannedQty <= 10000000
+        && isValidString(data.outputUnit, 1, 20)
+        && isValidString(data.plannedDate, 1, 32)
+        && isValidString(data.lineName, 1, 80)
+        && isValidString(data.assignedTeam, 1, 80)
+        && data.status in ['Planned', 'Released', 'In Progress', 'QC Hold', 'Completed', 'Closed']
+        && data.availabilityChecked is bool
+        && data.shortageCount is number && data.shortageCount >= 0 && data.shortageCount <= 100
+        && data.issuedMaterials is list && data.issuedMaterials.size() <= 40
+        && (data.issuedMaterials.size() == 0 || data.issuedMaterials[0] is map)
+        && data.processChecks is list && data.processChecks.size() <= 20
+        && (data.processChecks.size() == 0 || data.processChecks[0] is map)
+        && data.goodQty is number && data.goodQty >= 0 && data.goodQty <= 10000000
+        && data.rejectedQty is number && data.rejectedQty >= 0 && data.rejectedQty <= 10000000
+        && data.sampleQty is number && data.sampleQty >= 0 && data.sampleQty <= 10000000
+        && data.reworkQty is number && data.reworkQty >= 0 && data.reworkQty <= 10000000
+        && data.wasteKg is number && data.wasteKg >= 0 && data.wasteKg <= 1000000
+        && data.yieldPct is number && data.yieldPct >= 0 && data.yieldPct <= 200
+        && data.variancePct is number && data.variancePct >= -100 && data.variancePct <= 200
+        && data.materialCost is number && data.materialCost >= 0 && data.materialCost <= 10000000
+        && data.laborCost is number && data.laborCost >= 0 && data.laborCost <= 10000000
+        && data.overheadCost is number && data.overheadCost >= 0 && data.overheadCost <= 10000000
+        && data.unitCost is number && data.unitCost >= 0 && data.unitCost <= 1000000
+        && data.qcStatus in ['Pending', 'Passed', 'Failed']
+        && isValidString(data.qcNotes, 0, 500)
+        && isValidString(data.qcInspector, 0, 100)
+        && data.postedToInventory is bool
+        && isValidString(data.finishedGoodId, 0, 128)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidFinishedGoodLot(data) {
+      return data.keys().hasAll([
+          'ownerId', 'batchId', 'batchNumber', 'lotNumber', 'sku',
+          'productName', 'quantityProduced', 'quantityAvailable', 'unit',
+          'productionDate', 'expiryDate', 'qcStatus', 'warehouseZone',
+          'unitCost', 'shipments', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'batchId', 'batchNumber', 'lotNumber', 'sku',
+          'productName', 'quantityProduced', 'quantityAvailable', 'unit',
+          'productionDate', 'expiryDate', 'qcStatus', 'warehouseZone',
+          'unitCost', 'shipments', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && isValidId(data.batchId)
+        && isValidString(data.batchNumber, 1, 64)
+        && isValidString(data.lotNumber, 1, 64)
+        && isValidString(data.sku, 1, 40)
+        && isValidString(data.productName, 1, 120)
+        && data.quantityProduced is number && data.quantityProduced >= 0 && data.quantityProduced <= 10000000
+        && data.quantityAvailable is number && data.quantityAvailable >= 0 && data.quantityAvailable <= 10000000
+        && isValidString(data.unit, 1, 20)
+        && isValidString(data.productionDate, 1, 32)
+        && isValidString(data.expiryDate, 1, 32)
+        && data.qcStatus in ['Released', 'Quarantined']
+        && isValidString(data.warehouseZone, 1, 80)
+        && data.unitCost is number && data.unitCost >= 0 && data.unitCost <= 1000000
+        && data.shipments is list && data.shipments.size() <= 25
+        && (data.shipments.size() == 0 || data.shipments[0] is map)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidThermalSensor(data) {
+      return data.keys().hasAll([
+          'ownerId', 'sensorCode', 'name', 'zone', 'equipmentType',
+          'linkedLine', 'currentTempC', 'targetTempC', 'minSafeTempC',
+          'maxSafeTempC', 'humidityPct', 'status', 'yieldImpactNote',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'sensorCode', 'name', 'zone', 'equipmentType',
+          'linkedLine', 'currentTempC', 'targetTempC', 'minSafeTempC',
+          'maxSafeTempC', 'humidityPct', 'status', 'yieldImpactNote',
+          'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && isValidString(data.sensorCode, 1, 32)
+        && isValidString(data.name, 1, 100)
+        && isValidString(data.zone, 1, 80)
+        && isValidString(data.equipmentType, 1, 60)
+        && isValidString(data.linkedLine, 0, 80)
+        && data.currentTempC is number && data.currentTempC >= -60 && data.currentTempC <= 300
+        && data.targetTempC is number && data.targetTempC >= -60 && data.targetTempC <= 300
+        && data.minSafeTempC is number && data.minSafeTempC >= -60 && data.minSafeTempC <= 300
+        && data.maxSafeTempC is number && data.maxSafeTempC >= -60 && data.maxSafeTempC <= 300
+        && data.humidityPct is number && data.humidityPct >= 0 && data.humidityPct <= 100
+        && data.status in ['Nominal', 'Warning', 'Excursion']
+        && isValidString(data.yieldImpactNote, 0, 240)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // --- Collection Rules ---
+
+    // Admins registry (read-only self check; never client-writable)
+    match /admins/{adminId} {
+      allow get: if isValidId(adminId) && isOwner(adminId);
+      allow list, create, update, delete: if false;
+    }
+
+    // User profiles (PII-free, strictly owner-isolated)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if false;
+      allow create: if isVerifiedUser()
+        && isValidId(userId)
+        && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'role', 'plantName', 'updatedAt']))
+        );
+      allow delete: if false;
+    }
+
+    // Versioned Formulas & BOMs
+    match /formulas/{formulaId} {
+      allow get: if isValidId(formulaId) && isVerifiedUser() && (isOwner(existing().ownerId) || isAdmin());
+      allow list: if isVerifiedUser() && (resource.data.ownerId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerifiedUser()
+        && isValidId(formulaId)
+        && isValidFormulaBOM(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedUser()
+        && isValidId(formulaId)
+        && isValidFormulaBOM(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (existing().approvalStatus != 'Archived' || isAdmin())
+        && (
+          isAdmin() ||
+          // Action: Approve or archive formula version
+          (isOwner(existing().ownerId) && incoming().diff(existing()).affectedKeys().hasOnly(['approvalStatus', 'updatedAt'])) ||
+          // Action: Update draft formula details before approval
+          (isOwner(existing().ownerId) && existing().approvalStatus == 'Draft' && incoming().diff(existing()).affectedKeys().hasOnly(['approvalStatus', 'isConfidentialOem', 'oemCustomer', 'laborCostPerBatch', 'overheadCostPerBatch', 'ingredients', 'routingSteps', 'updatedAt']))
+        );
+      allow delete: if isValidId(formulaId) && isVerifiedUser() && (isOwner(existing().ownerId) || isAdmin());
+    }
+
+    // Raw Material & Packaging Lots
+    match /rawMaterials/{lotId} {
+      allow get: if isValidId(lotId) && isVerifiedUser() && (isOwner(existing().ownerId) || isAdmin());
+      allow list: if isVerifiedUser() && (resource.data.ownerId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerifiedUser()
+        && isValidId(lotId)
+        && isValidRawMaterialLot(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedUser()
+        && isValidId(lotId)
+        && isValidRawMaterialLot(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          // Action: Deduct or replenish lot stock
+          (isOwner(existing().ownerId) && incoming().diff(existing()).affectedKeys().hasOnly(['quantityAvailable', 'status', 'updatedAt'])) ||
+          // Action: Adjust reorder level or storage zone
+          (isOwner(existing().ownerId) && incoming().diff(existing()).affectedKeys().hasOnly(['reorderLevel', 'storageZone', 'unitCost', 'status', 'updatedAt']))
+        );
+      allow delete: if isValidId(lotId) && isVerifiedUser() && (isOwner(existing().ownerId) || isAdmin());
+    }
+
+    // Production Work Orders & Batch Records
+    match /batches/{batchId} {
+      allow get: if isValidId(batchId) && isVerifiedUser() && (isOwner(existing().ownerId) || isAdmin());
+      allow list: if isVerifiedUser() && (resource.data.ownerId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerifiedUser()
+        && isValidId(batchId)
+        && isValidProductionBatch(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && get(/databases/$(database)/documents/formulas/$(incoming().formulaId)).data.ownerId == request.auth.uid;
+      allow update: if isVerifiedUser()
+        && isValidId(batchId)
+        && isValidProductionBatch(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().formulaId == existing().formulaId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (existing().status != 'Closed' || isAdmin())
+        && (
+          isAdmin() ||
+          // Action: Check availability & Release work order
+          (isOwner(existing().ownerId) && incoming().diff(existing()).affectedKeys().hasOnly(['availabilityChecked', 'shortageCount', 'status', 'lotNumber', 'updatedAt'])) ||
+          // Action: Issue raw material lots & start production
+          (isOwner(existing().ownerId) && incoming().diff(existing()).affectedKeys().hasOnly(['issuedMaterials', 'materialCost', 'unitCost', 'status', 'updatedAt'])) ||
+          // Action: Record routing process & thermal checks
+          (isOwner(existing().ownerId) && incoming().diff(existing()).affectedKeys().hasOnly(['processChecks', 'status', 'updatedAt'])) ||
+          // Action: Report production output, yield & move to QC Hold
+          (isOwner(existing().ownerId) && incoming().diff(existing()).affectedKeys().hasOnly(['goodQty', 'rejectedQty', 'sampleQty', 'reworkQty', 'wasteKg', 'yieldPct', 'variancePct', 'unitCost', 'status', 'updatedAt'])) ||
+          // Action: QC Release, auto-post finished goods & close batch
+          (isOwner(existing().ownerId) && incoming().diff(existing()).affectedKeys().hasOnly(['qcStatus', 'qcNotes', 'qcInspector', 'postedToInventory', 'finishedGoodId', 'status', 'updatedAt']))
+        );
+      allow delete: if isValidId(batchId) && isVerifiedUser() && (isOwner(existing().ownerId) || isAdmin());
+    }
+
+    // Finished Goods Inventory Lots
+    match /finishedGoods/{fgId} {
+      allow get: if isValidId(fgId) && isVerifiedUser() && (isOwner(existing().ownerId) || isAdmin());
+      allow list: if isVerifiedUser() && (resource.data.ownerId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerifiedUser()
+        && isValidId(fgId)
+        && isValidFinishedGoodLot(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && get(/databases/$(database)/documents/batches/$(incoming().batchId)).data.ownerId == request.auth.uid;
+      allow update: if isVerifiedUser()
+        && isValidId(fgId)
+        && isValidFinishedGoodLot(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().batchId == existing().batchId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          // Action: Record customer shipment & deduct available finished stock
+          (isOwner(existing().ownerId) && incoming().diff(existing()).affectedKeys().hasOnly(['shipments', 'quantityAvailable', 'updatedAt'])) ||
+          // Action: Update quarantine or warehouse location
+          (isOwner(existing().ownerId) && incoming().diff(existing()).affectedKeys().hasOnly(['qcStatus', 'warehouseZone', 'updatedAt']))
+        );
+      allow delete: if isValidId(fgId) && isVerifiedUser() && (isOwner(existing().ownerId) || isAdmin());
+    }
+
+    // Real-Time HACCP Temperature Sensors
+    match /sensors/{sensorId} {
+      allow get: if isValidId(sensorId) && isVerifiedUser() && (isOwner(existing().ownerId) || isAdmin());
+      allow list: if isVerifiedUser() && (resource.data.ownerId == request.auth.uid || isBootstrappedAdmin());
+      allow create: if isVerifiedUser()
+        && isValidId(sensorId)
+        && isValidThermalSensor(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerifiedUser()
+        && isValidId(sensorId)
+        && isValidThermalSensor(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          // Action: Update live reading or setpoint optimization
+          (isOwner(existing().ownerId) && incoming().diff(existing()).affectedKeys().hasOnly(['currentTempC', 'targetTempC', 'minSafeTempC', 'maxSafeTempC', 'humidityPct', 'status', 'yieldImpactNote', 'updatedAt']))
+        );
+      allow delete: if isValidId(sensorId) && isVerifiedUser() && (isOwner(existing().ownerId) || isAdmin());
+    }
+  }
+}

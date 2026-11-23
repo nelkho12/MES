@@ -1,0 +1,215 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated plant operator, QC inspector, or production manager profile.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "role": { "type": "string", "enum": ["manager", "operator", "qc"] },
+        "plantName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "displayName", "role", "plantName", "createdAt", "updatedAt"]
+    },
+    "FormulaBOM": {
+      "title": "FormulaBOM",
+      "description": "Versioned food manufacturing formula, BOM ingredients/packaging, and process routing steps.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "sku": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "productName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "packSize": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "shelfLifeDays": { "type": "number" },
+        "standardBatchSize": { "type": "number" },
+        "outputUnit": { "type": "string", "minLength": 1, "maxLength": 20 },
+        "version": { "type": "string", "minLength": 1, "maxLength": 24 },
+        "approvalStatus": { "type": "string", "enum": ["Draft", "Approved", "Archived"] },
+        "isConfidentialOem": { "type": "boolean" },
+        "oemCustomer": { "type": "string", "maxLength": 100 },
+        "laborCostPerBatch": { "type": "number" },
+        "overheadCostPerBatch": { "type": "number" },
+        "ingredients": { "type": "array", "description": "Bounded list (max 30) of BOM ingredient/packaging lines." },
+        "routingSteps": { "type": "array", "description": "Bounded list (max 15) of manufacturing process steps." },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerId", "sku", "productName", "packSize", "shelfLifeDays",
+        "standardBatchSize", "outputUnit", "version", "approvalStatus",
+        "isConfidentialOem", "oemCustomer", "laborCostPerBatch", "overheadCostPerBatch",
+        "ingredients", "routingSteps", "createdAt", "updatedAt"
+      ]
+    },
+    "RawMaterialLot": {
+      "title": "RawMaterialLot",
+      "description": "Lot-tracked raw material or packaging inventory record.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "lotNumber": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "materialCode": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "materialName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "category": { "type": "string", "enum": ["Ingredient", "Packaging"] },
+        "unit": { "type": "string", "enum": ["kg", "g", "L", "ml", "pcs"] },
+        "quantityInitial": { "type": "number" },
+        "quantityAvailable": { "type": "number" },
+        "reorderLevel": { "type": "number" },
+        "unitCost": { "type": "number" },
+        "supplier": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "expiryDate": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "storageZone": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "status": { "type": "string", "enum": ["Available", "Low", "Depleted", "Expired"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerId", "lotNumber", "materialCode", "materialName", "category",
+        "unit", "quantityInitial", "quantityAvailable", "reorderLevel",
+        "unitCost", "supplier", "expiryDate", "storageZone", "status",
+        "createdAt", "updatedAt"
+      ]
+    },
+    "ProductionBatch": {
+      "title": "ProductionBatch",
+      "description": "Work order, execution batch record, in-process thermal/QC checks, output record, and costing.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "batchNumber": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "lotNumber": { "type": "string", "maxLength": 64 },
+        "formulaId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "formulaVersion": { "type": "string", "minLength": 1, "maxLength": 24 },
+        "sku": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "productName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "sourceType": { "type": "string", "enum": ["Sales Demand", "Low Stock Alert", "OEM Request"] },
+        "sourceRef": { "type": "string", "maxLength": 80 },
+        "plannedQty": { "type": "number" },
+        "outputUnit": { "type": "string", "minLength": 1, "maxLength": 20 },
+        "plannedDate": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "lineName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "assignedTeam": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "status": { "type": "string", "enum": ["Planned", "Released", "In Progress", "QC Hold", "Completed", "Closed"] },
+        "availabilityChecked": { "type": "boolean" },
+        "shortageCount": { "type": "number" },
+        "issuedMaterials": { "type": "array", "description": "Bounded list (max 40) of issued lot records." },
+        "processChecks": { "type": "array", "description": "Bounded list (max 20) of recorded routing/thermal checks." },
+        "goodQty": { "type": "number" },
+        "rejectedQty": { "type": "number" },
+        "sampleQty": { "type": "number" },
+        "reworkQty": { "type": "number" },
+        "wasteKg": { "type": "number" },
+        "yieldPct": { "type": "number" },
+        "variancePct": { "type": "number" },
+        "materialCost": { "type": "number" },
+        "laborCost": { "type": "number" },
+        "overheadCost": { "type": "number" },
+        "unitCost": { "type": "number" },
+        "qcStatus": { "type": "string", "enum": ["Pending", "Passed", "Failed"] },
+        "qcNotes": { "type": "string", "maxLength": 500 },
+        "qcInspector": { "type": "string", "maxLength": 100 },
+        "postedToInventory": { "type": "boolean" },
+        "finishedGoodId": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerId", "batchNumber", "lotNumber", "formulaId", "formulaVersion",
+        "sku", "productName", "sourceType", "sourceRef", "plannedQty",
+        "outputUnit", "plannedDate", "lineName", "assignedTeam", "status",
+        "availabilityChecked", "shortageCount", "issuedMaterials", "processChecks",
+        "goodQty", "rejectedQty", "sampleQty", "reworkQty", "wasteKg",
+        "yieldPct", "variancePct", "materialCost", "laborCost", "overheadCost",
+        "unitCost", "qcStatus", "qcNotes", "qcInspector", "postedToInventory",
+        "finishedGoodId", "createdAt", "updatedAt"
+      ]
+    },
+    "FinishedGoodLot": {
+      "title": "FinishedGoodLot",
+      "description": "Finished goods inventory posted automatically after QC release, with customer shipment traceability.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "batchId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "batchNumber": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "lotNumber": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "sku": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "productName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "quantityProduced": { "type": "number" },
+        "quantityAvailable": { "type": "number" },
+        "unit": { "type": "string", "minLength": 1, "maxLength": 20 },
+        "productionDate": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "expiryDate": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "qcStatus": { "type": "string", "enum": ["Released", "Quarantined"] },
+        "warehouseZone": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "unitCost": { "type": "number" },
+        "shipments": { "type": "array", "description": "Bounded list (max 25) of customer dispatch shipments." },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerId", "batchId", "batchNumber", "lotNumber", "sku",
+        "productName", "quantityProduced", "quantityAvailable", "unit",
+        "productionDate", "expiryDate", "qcStatus", "warehouseZone",
+        "unitCost", "shipments", "createdAt", "updatedAt"
+      ]
+    },
+    "ThermalSensor": {
+      "title": "ThermalSensor",
+      "description": "Real-time HACCP temperature sensor monitoring cooking kettles, pasteurizers, and cold storage.",
+      "type": "object",
+      "properties": {
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "sensorCode": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "zone": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "equipmentType": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "linkedLine": { "type": "string", "maxLength": 80 },
+        "currentTempC": { "type": "number" },
+        "targetTempC": { "type": "number" },
+        "minSafeTempC": { "type": "number" },
+        "maxSafeTempC": { "type": "number" },
+        "humidityPct": { "type": "number" },
+        "status": { "type": "string", "enum": ["Nominal", "Warning", "Excursion"] },
+        "yieldImpactNote": { "type": "string", "maxLength": 240 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "ownerId", "sensorCode", "name", "zone", "equipmentType",
+        "linkedLine", "currentTempC", "targetTempC", "minSafeTempC",
+        "maxSafeTempC", "humidityPct", "status", "yieldImpactNote",
+        "createdAt", "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Authenticated user role and facility configuration."
+    },
+    "/formulas/{formulaId}": {
+      "schema": { "$ref": "#/entities/FormulaBOM" },
+      "description": "Versioned recipes, BOMs, and process routing steps."
+    },
+    "/rawMaterials/{lotId}": {
+      "schema": { "$ref": "#/entities/RawMaterialLot" },
+      "description": "Lot-tracked raw ingredients and packaging inventory."
+    },
+    "/batches/{batchId}": {
+      "schema": { "$ref": "#/entities/ProductionBatch" },
+      "description": "Work orders and execution batch records across the 9-step lifecycle."
+    },
+    "/finishedGoods/{fgId}": {
+      "schema": { "$ref": "#/entities/FinishedGoodLot" },
+      "description": "QC-released finished goods inventory with customer shipment traceability."
+    },
+    "/sensors/{sensorId}": {
+      "schema": { "$ref": "#/entities/ThermalSensor" },
+      "description": "Plant HACCP temperature sensors and setpoint configurations."
+    }
+  }
+}
