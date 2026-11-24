@@ -648,3 +648,57 @@ export interface BatchCategoryCompletionResponse {
   inFlightCount: number;
 }
 
+export interface SqlAuthUser {
+  uid: string;
+  email: string;
+  displayName: string;
+  role: UserRole;
+  hasPassword?: boolean;
+}
+
+export type DbConnectionMode = 'env' | 'remote_ip';
+
+export interface DbConnectionConfigInput {
+  mode: DbConnectionMode;
+  host: string;
+  port: number;
+  database: string;
+  user: string;
+  password?: string;
+  ssl: boolean;
+  initializeSchema?: boolean;
+}
+
+export interface DbConnectionConfigPublic {
+  mode: DbConnectionMode;
+  host: string;
+  port: number;
+  database: string;
+  user: string;
+  ssl: boolean;
+  hasPassword: boolean;
+  configuredViaOverride: boolean;
+  activeHostLabel: string;
+  configPathLabel: string;
+}
+
+export interface DbConnectionTestResult {
+  ok: boolean;
+  message: string;
+  serverVersion?: string;
+  database?: string;
+  serverIp?: string | null;
+  serverPort?: number | null;
+  tableCount?: number;
+  latencyMs?: number;
+}
+
+export interface AuthStatusResponse {
+  authMode: 'sql';
+  sqlUsersCount: number;
+  hasPasswordedUsers: boolean;
+  legacySsoAvailable: boolean;
+  dbConfig: DbConnectionConfigPublic;
+}
+
+

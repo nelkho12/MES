@@ -5,6 +5,32 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { requireAuth, type AuthRequest } from './src/middleware/auth.ts';
 import {
+  authenticateSqlUser,
+  getSqlAuthStats,
+  getSqlUserSummary,
+  registerSqlUser,
+  updateSqlUserPassword,
+  verifySqlSessionToken,
+} from './src/lib/sqlAuth.ts';
+import {
+  clearOverrideDbConnectionConfig,
+  ensureRemoteSqlSchemaApplied,
+  getActiveDbConnectionConfig,
+  getPublicDbConnectionConfig,
+  saveOverrideDbConnectionConfig,
+  testSqlConnection,
+  validateRemoteIpDbInput,
+} from './src/db/connectionConfig.ts';
+import { reconfigureDbPool } from './src/db/index.ts';
+import {
+  listBatchesOrdered,
+  listFinishedGoodsOrdered,
+  listFormulasOrdered,
+  listProductionLinesOrdered,
+  listRawMaterialsOrdered,
+  listSensorsOrdered,
+} from './src/services/sqlService.ts';
+import {
   ForbiddenError,
   ValidationError,
   adjustRawMaterialLotDb,
@@ -94,18 +120,242 @@ async function startServer() {
   const httpServer = http.createServer(app);
   app.use(express.json({ limit: '2mb' }));
 
-  // --- Authenticated SQL REST API Routes ---
+  // --- Pure SQL Authentication & Desktop SQL IP Config Routes ---
+
+  async function canManageDbSettings(req: express.Request): Promise<boolean> {
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.split('Bearer ')[1];
+      const principal = verifySqlSessionToken(token);
+      if (principal) {
+        const actor = await getActorContextDb(principal.uid, principal.email, principal.name);
+        return actor.role === 'admin' || actor.role === 'manager';
+      }
+    }
+    const stats = await getSqlAuthStats();
+    if (stats.sqlUsersCount === 0) return true;
+    const remote = req.socket?.remoteAddress || req.ip || '';
+    return (
+      remote === '127.0.0.1' ||
+      remote === '::1' ||
+      remote === '::ffff:127.0.0.1'
+    );
+  }
+
+  app.get('/api/auth/status', async (_req, res) => {
+    try {
+      const stats = await getSqlAuthStats();
+      res.json({
+        authMode: 'sql',
+        sqlUsersCount: stats.sqlUsersCount,
+        hasPasswordedUsers: stats.hasPasswordedUsers,
+        legacySsoAvailable: false,
+        dbConfig: getPublicDbConnectionConfig(),
+      });
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Unable to read auth status';
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  app.post('/api/auth/login', async (req, res) => {
+    try {
+      const { email, password } = req.body || {};
+      const result = await authenticateSqlUser(String(email || ''), String(password || ''));
+      res.json(result);
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Authentication failed';
+      res.status(401).json({ error: msg });
+    }
+  });
+
+  app.post('/api/auth/register', async (req, res) => {
+    try {
+      const { email, password, displayName, role } = req.body || {};
+      const result = await registerSqlUser({
+        email: String(email || ''),
+        password: String(password || ''),
+        displayName: typeof displayName === 'string' ? displayName : undefined,
+        role,
+      });
+      res.status(201).json(result);
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Registration failed';
+      res.status(400).json({ error: msg });
+    }
+  });
+
+  app.get('/api/auth/me', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const user = await getSqlUserSummary(req.user!.uid);
+      if (!user) {
+        return res.status(404).json({ error: 'SQL user account not found.' });
+      }
+      res.json({ user });
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Failed to load user summary';
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  app.patch('/api/auth/password', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const { newPassword, currentPassword } = req.body || {};
+      await updateSqlUserPassword(
+        req.user!.uid,
+        String(newPassword || ''),
+        typeof currentPassword === 'string' ? currentPassword : undefined
+      );
+      res.json({ ok: true });
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Failed to update password';
+      res.status(400).json({ error: msg });
+    }
+  });
+
+  app.get('/api/system/db-config', async (req, res) => {
+    try {
+      if (!(await canManageDbSettings(req))) {
+        return res.status(403).json({
+          error: 'Admin or Manager sign-in is required to view SQL server connection settings.',
+        });
+      }
+      res.json({ config: getPublicDbConnectionConfig() });
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Failed to read SQL config';
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  app.post('/api/system/db-test', async (req, res) => {
+    try {
+      if (!(await canManageDbSettings(req))) {
+        return res.status(403).json({
+          ok: false,
+          message: 'Admin or Manager sign-in is required to test SQL connections.',
+        });
+      }
+      const existing = getActiveDbConnectionConfig();
+      const candidate = validateRemoteIpDbInput(req.body || {}, existing.password);
+      const testResult = await testSqlConnection(candidate);
+      res.json(testResult);
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Invalid SQL connection settings';
+      res.status(400).json({ ok: false, message: msg });
+    }
+  });
+
+  app.post('/api/system/db-config', async (req, res) => {
+    try {
+      if (!(await canManageDbSettings(req))) {
+        return res.status(403).json({
+          error: 'Admin or Manager sign-in is required to modify SQL server settings.',
+        });
+      }
+      const existing = getActiveDbConnectionConfig();
+      const candidate = validateRemoteIpDbInput(req.body || {}, existing.password);
+      const testResult = await testSqlConnection(candidate);
+      if (!testResult.ok) {
+        return res.status(400).json({ error: testResult.message, testResult });
+      }
+      if (req.body?.initializeSchema !== false) {
+        await ensureRemoteSqlSchemaApplied(candidate);
+      }
+      saveOverrideDbConnectionConfig(candidate);
+      reconfigureDbPool(candidate);
+      const postTest = await testSqlConnection(candidate);
+      res.json({
+        config: getPublicDbConnectionConfig(),
+        testResult: postTest,
+      });
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Failed to save SQL configuration';
+      res.status(400).json({ error: msg });
+    }
+  });
+
+  app.post('/api/system/db-reset-env', async (req, res) => {
+    try {
+      if (!(await canManageDbSettings(req))) {
+        return res.status(403).json({
+          error: 'Admin or Manager sign-in is required to reset SQL server settings.',
+        });
+      }
+      clearOverrideDbConnectionConfig();
+      reconfigureDbPool();
+      res.json({ config: getPublicDbConnectionConfig() });
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Failed to reset SQL configuration';
+      res.status(500).json({ error: msg });
+    }
+  });
+
+  // --- Authenticated SQL REST API Routes (backed by sqlService.ts) ---
 
   app.get('/api/workspace', requireAuth, async (req: AuthRequest, res) => {
     try {
       const uid = req.user!.uid;
-      const email = req.user!.email || 'operator@kettler.local';
+      const email = req.user!.email || 'operator@plant.local';
       const displayName = req.user!.name || email;
       const snapshot = await getWorkspaceSnapshot(uid, email, displayName);
       res.json(snapshot);
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : 'Failed to load workspace';
       res.status(500).json({ error: msg });
+    }
+  });
+
+  app.get('/api/formulas', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const rows = await listFormulasOrdered(req.user!.uid);
+      res.json({ formulas: rows });
+    } catch (error: unknown) {
+      handleRouteError(res, error, 'Failed to fetch formulas from SQL');
+    }
+  });
+
+  app.get('/api/raw-materials', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const rows = await listRawMaterialsOrdered(req.user!.uid);
+      res.json({ rawMaterials: rows });
+    } catch (error: unknown) {
+      handleRouteError(res, error, 'Failed to fetch raw materials from SQL');
+    }
+  });
+
+  app.get('/api/batches', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const rows = await listBatchesOrdered(req.user!.uid);
+      res.json({ batches: rows });
+    } catch (error: unknown) {
+      handleRouteError(res, error, 'Failed to fetch batches from SQL');
+    }
+  });
+
+  app.get('/api/finished-goods', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const rows = await listFinishedGoodsOrdered(req.user!.uid);
+      res.json({ finishedGoods: rows });
+    } catch (error: unknown) {
+      handleRouteError(res, error, 'Failed to fetch finished goods from SQL');
+    }
+  });
+
+  app.get('/api/sensors', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const rows = await listSensorsOrdered(req.user!.uid);
+      res.json({ sensors: rows });
+    } catch (error: unknown) {
+      handleRouteError(res, error, 'Failed to fetch sensors from SQL');
+    }
+  });
+
+  app.get('/api/production-lines', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const rows = await listProductionLinesOrdered(req.user!.uid);
+      res.json({ productionLines: rows });
+    } catch (error: unknown) {
+      handleRouteError(res, error, 'Failed to fetch production lines from SQL');
     }
   });
 
@@ -825,7 +1075,7 @@ export class ErrorOverlay {}
   }
 
   httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`Kettler MES standalone server listening on http://0.0.0.0:${PORT}`);
+    console.log(`Manufacturing Execution System standalone server listening on http://0.0.0.0:${PORT}`);
   });
 }
 

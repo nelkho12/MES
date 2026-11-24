@@ -40,7 +40,7 @@ export function PWAInstallButton() {
             <div className="w-full max-w-sm rounded-lg bg-white border border-slate-200 p-6">
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-semibold text-slate-900">
-                  Install Kettler MES on iPad / iPhone
+                  Install Manufacturing Execution System on iPad / iPhone
                 </h3>
                 <button
                   type="button"
@@ -55,7 +55,7 @@ export function PWAInstallButton() {
                 <br />
                 2. Scroll down and select <strong>Add to Home Screen</strong>.
                 <br />
-                3. Launch Kettler MES directly as a standalone floor workstation app.
+                3. Launch Manufacturing Execution System directly as a standalone floor workstation app.
               </p>
               <button
                 type="button"

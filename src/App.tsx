@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { onAuthStateChanged, signOut, type User } from 'firebase/auth';
 import {
   AlertTriangle,
   BarChart3,
@@ -12,17 +11,18 @@ import {
   LayoutDashboard,
   LogOut,
   RotateCcw,
+  Server,
   Settings,
   Settings2,
   ShieldCheck,
 } from 'lucide-react';
-import { auth } from './firebase';
 import type {
   ActiveTab,
   AuditLogEntry,
   BatchCheckRecord,
   BatchCheckSpec,
   CategoryParameterPresetMap,
+  DbConnectionConfigPublic,
   FinishedGoodLot,
   FormulaBOM,
   ProductionBatch,
@@ -30,12 +30,13 @@ import type {
   RawMaterialLot,
   RolePermissionMatrix,
   SensorAdapterConfig,
+  SqlAuthUser,
   TelemetryHistoryPoint,
   ThermalSensor,
   UserRole,
   WmsConnectorConfig,
 } from './types';
-import { computeYieldOptimizations, evaluateSensorStatus } from './utils/units';
+import { computeYieldOptimizations } from './utils/units';
 import {
   countEnabledFeatures,
   DEFAULT_ROLE_PERMISSIONS,
@@ -45,13 +46,21 @@ import {
 import { DEFAULT_SENSOR_ADAPTER_CONFIG } from './services/sensorAdapter';
 import { DEFAULT_WMS_CONNECTOR_CONFIG } from './services/wmsConnector';
 import {
+  fetchSensorsFromSql,
   fetchWorkspaceSnapshot,
   updateThermalSensor,
   updateUserRole,
   WORKSPACE_SYNC_EVENT,
 } from './services/mesService';
+import {
+  fetchDbConnectionConfig,
+  logoutSqlSession,
+  restoreSqlSession,
+  subscribeSqlAuth,
+} from './services/sqlAuthClient';
 import { SensorSettingsModal } from './components/SensorSettingsModal';
 import { AdminSettingsModal } from './components/AdminSettingsModal';
+import { DesktopSqlModal } from './components/DesktopSqlModal';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { AuthGate } from './components/AuthGate';
 import { OverviewView } from './components/OverviewView';
@@ -87,23 +96,55 @@ const TAB_TITLES: Record<ActiveTab, string> = {
   reports: 'Monthly KPI Yield & Production Output Report',
 };
 
-function buildInitialHistory(sensors: ThermalSensor[]): TelemetryHistoryPoint[] {
-  const now = Date.now();
-  const points: TelemetryHistoryPoint[] = [];
-  for (let i = 11; i >= 0; i--) {
-    const t = new Date(now - i * 5000);
-    const label = t.toTimeString().slice(0, 8);
-    const point: TelemetryHistoryPoint = { time: label };
-    for (const s of sensors) {
-      const wave = Math.sin(i * 0.65 + s.sensorCode.length) * 0.45;
-      point[s.sensorCode] = Number((s.currentTempC + wave).toFixed(1));
-    }
-    points.push(point);
+function formatTelemetryTime(isoOrDate?: string | Date): string {
+  if (!isoOrDate) return new Date().toTimeString().slice(0, 8);
+  const dt = isoOrDate instanceof Date ? isoOrDate : new Date(isoOrDate);
+  if (!Number.isNaN(dt.getTime())) {
+    return dt.toTimeString().slice(0, 8);
   }
-  return points;
+  return String(isoOrDate).slice(0, 8);
 }
 
-function MesWorkspace({ user }: { user: User }) {
+function buildRealTelemetryHistory(
+  sensors: ThermalSensor[],
+  batches: ProductionBatch[]
+): TelemetryHistoryPoint[] {
+  const bucketMap = new Map<string, TelemetryHistoryPoint>();
+
+  const recordedChecks = batches
+    .flatMap((batch) => batch.processChecks || [])
+    .filter((chk) => typeof chk.recordedTempC === 'number' && Number.isFinite(chk.recordedTempC))
+    .sort((a, b) => new Date(a.recordedAt).getTime() - new Date(b.recordedAt).getTime())
+    .slice(-24);
+
+  for (const chk of recordedChecks) {
+    const label = formatTelemetryTime(chk.recordedAt);
+    const point = bucketMap.get(label) || { time: label };
+    const code = chk.sensorCode || sensors.find((s) => s.name === chk.stepName)?.sensorCode;
+    if (code && chk.recordedTempC !== null) {
+      point[code] = Number(chk.recordedTempC.toFixed(1));
+      bucketMap.set(label, point);
+    }
+  }
+
+  if (sensors.length > 0) {
+    const latestTs = sensors
+      .map((s) => (s.updatedAt ? new Date(s.updatedAt).getTime() : 0))
+      .filter((t) => Number.isFinite(t) && t > 0)
+      .sort((a, b) => a - b)
+      .pop();
+    const currentLabel = formatTelemetryTime(latestTs ? new Date(latestTs) : undefined);
+    const currentPoint = bucketMap.get(currentLabel) || { time: currentLabel };
+    for (const s of sensors) {
+      currentPoint[s.sensorCode] = Number(s.currentTempC.toFixed(1));
+    }
+    bucketMap.set(currentLabel, currentPoint);
+  }
+
+  return Array.from(bucketMap.values()).slice(-16);
+}
+
+function MesWorkspace({ user }: { user: SqlAuthUser }) {
   const [activeTab, setActiveTab] = useState<ActiveTab>('overview');
   const [userRole, setUserRole] = useState<UserRole>('manager');
   const [formulas, setFormulas] = useState<FormulaBOM[]>([]);
@@ -141,6 +182,9 @@ function MesWorkspace({ user }: { user: User }) {
     useState<CategoryParameterPresetMap>({});
   const [showSensorSettings, setShowSensorSettings] = useState(false);
   const [showAdminSettings, setShowAdminSettings] = useState(false);
+  const [showDesktopSqlModal, setShowDesktopSqlModal] = useState(false);
+  const [desktopSqlTab, setDesktopSqlTab] = useState<'sql' | 'desktop' | 'password'>('sql');
+  const [dbConfig, setDbConfig] = useState<DbConnectionConfigPublic | null>(null);
   const [adminInitialTab, setAdminInitialTab] = useState<'roles' | 'rest' | 'files' | 'spec'>('roles');
   const [isStreaming, setIsStreaming] = useState(false);
   const [loadingWorkspace, setLoadingWorkspace] = useState(true);
@@ -200,11 +244,7 @@ function MesWorkspace({ user }: { user: User }) {
       if (snapshot.profile.categoryParameterPresets) {
         setCategoryParameterPresets(snapshot.profile.categoryParameterPresets);
       }
-      setTelemetryHistory((prev) =>
-        prev.length === 0 && snapshot.sensors.length > 0
-          ? buildInitialHistory(snapshot.sensors)
-          : prev
-      );
+      setTelemetryHistory(buildRealTelemetryHistory(snapshot.sensors, snapshot.batches));
       setLastSavedAt(new Date().toTimeString().slice(0, 8));
       setWorkspaceError(null);
     } catch (error) {
@@ -218,9 +258,14 @@ function MesWorkspace({ user }: { user: User }) {
     }
   }, []);
 
-  // Load workspace on sign-in and re-sync whenever a mutation completes
+  // Load workspace & active SQL endpoint info on sign-in, and re-sync whenever a mutation completes
   useEffect(() => {
     void loadWorkspace(true);
+    void fetchDbConnectionConfig()
+      .then(setDbConfig)
+      .catch(() => {
+        // Non-privileged roles may not inspect DB host config; ignore silently
+      });
 
     const handleSync = () => {
       void loadWorkspace(false);
@@ -231,33 +276,38 @@ function MesWorkspace({ user }: { user: User }) {
     };
   }, [user, loadWorkspace]);
 
-  // Live sensor telemetry streaming tick (only active when Master Sensor Switch is ON & streaming)
+  // Live sensor telemetry polling from PostgreSQL (only active when Master Sensor Switch is ON & streaming)
   useEffect(() => {
-    if (!sensorConfig.masterEnabled || !isStreaming || sensors.length === 0) return;
+    if (!sensorConfig.masterEnabled || !isStreaming) return;
+
+    const intervalMs = Math.max(3000, (sensorConfig.pollingIntervalSec || 5) * 1000);
+    let cancelled = false;
 
     const timer = window.setInterval(() => {
-      const label = new Date().toTimeString().slice(0, 8);
-      const nextSensors = sensors.map((s) => {
-        const jitter = (Math.random() - 0.5) * 0.4;
-        const reading = Number((s.currentTempC + jitter).toFixed(1));
-        return {
-          ...s,
-          currentTempC: reading,
-          status: evaluateSensorStatus(reading, s.minSafeTempC, s.maxSafeTempC),
-        };
-      });
-      setLiveSensors(nextSensors);
-      setTelemetryHistory((prev) => {
-        const point: TelemetryHistoryPoint = { time: label };
-        for (const s of nextSensors) {
-          point[s.sensorCode] = s.currentTempC;
-        }
-        return [...prev.slice(-15), point];
-      });
-    }, 3000);
+      void fetchSensorsFromSql()
+        .then((latestSensors) => {
+          if (cancelled) return;
+          setSensors(latestSensors);
+          setLiveSensors(latestSensors);
+          const label = new Date().toTimeString().slice(0, 8);
+          setTelemetryHistory((prev) => {
+            const point: TelemetryHistoryPoint = { time: label };
+            for (const s of latestSensors) {
+              point[s.sensorCode] = Number(s.currentTempC.toFixed(1));
+            }
+            return [...prev.slice(-15), point];
+          });
+        })
+        .catch(() => {
+          // Keep last verified PostgreSQL readings if a single poll fails
+        });
+    }, intervalMs);
 
-    return () => window.clearInterval(timer);
-  }, [sensorConfig.masterEnabled, isStreaming, sensors]);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [sensorConfig.masterEnabled, sensorConfig.pollingIntervalSec, isStreaming]);
 
   const recommendations = useMemo(
     () => computeYieldOptimizations(liveSensors, batches, rawMaterials),
@@ -318,8 +368,8 @@ function MesWorkspace({ user }: { user: User }) {
       >
         <div>
           <div className="h-16 px-6 border-b border-slate-200 flex items-center">
-            <span className="font-display text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap">
-              Kettler MES
+            <span className="font-display text-sm font-bold tracking-tight text-slate-900 leading-tight">
+              Manufacturing Execution System
             </span>
           </div>
 
@@ -483,6 +533,22 @@ function MesWorkspace({ user }: { user: User }) {
                 {wmsConfig.enabled ? 'REST' : 'FILE'}
               </span>
             </button>
+            <button
+              type="button"
+              onClick={() => {
+                setDesktopSqlTab('sql');
+                setShowDesktopSqlModal(true);
+              }}
+              className="w-full flex items-center justify-between gap-2 px-3 py-2 text-xs font-medium rounded-md border border-slate-200 bg-white hover:border-teal-600 text-slate-700"
+            >
+              <span className="flex items-center gap-2 min-w-0">
+                <Server className="w-3.5 h-3.5 text-teal-700 shrink-0" />
+                <span className="truncate">SQL IP &amp; Desktop</span>
+              </span>
+              <span className="font-mono text-[10px] font-semibold px-1.5 py-0.5 rounded bg-teal-50 text-teal-800 shrink-0">
+                PG
+              </span>
+            </button>
           </div>
 
           <div className="mx-3 mt-3">
@@ -496,11 +562,13 @@ function MesWorkspace({ user }: { user: User }) {
             <div className="text-xs font-semibold text-slate-900 truncate">
               {user.displayName || 'Plant Operator'}
             </div>
-            <div className="text-[11px] text-slate-500 truncate">{user.email}</div>
+            <div className="text-[11px] text-slate-500 truncate">
+              {dbConfig?.host ? `${user.email} · ${dbConfig.host}` : user.email}
+            </div>
           </div>
           <button
             type="button"
-            onClick={() => void signOut(auth)}
+            onClick={() => void logoutSqlSession()}
             title="Sign out"
             className="p-2 text-slate-400 hover:text-slate-800 rounded-md transition-colors shrink-0"
           >
@@ -775,6 +843,19 @@ function MesWorkspace({ user }: { user: User }) {
         />
       )}
 
+      {showDesktopSqlModal && (
+        <DesktopSqlModal
+          currentUser={user}
+          initialTab={desktopSqlTab}
+          onClose={() => setShowDesktopSqlModal(false)}
+          onDatabaseSwitched={(cfg) => {
+            setDbConfig(cfg);
+            void loadWorkspace(true);
+          }}
+          onNotify={showToast}
+        />
+      )}
+
       {/* Action Feedback Toast */}
       {toast && (
         <div
@@ -793,12 +874,14 @@ function MesWorkspace({ user }: { user: User }) {
 }
 
 export default function App() {
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUser] = useState<SqlAuthUser | null>(null);
   const [authReady, setAuthReady] = useState(false);
 
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (u) => {
-      setUser(u);
+    const unsub = subscribeSqlAuth((nextUser) => {
+      setUser(nextUser);
+    });
+    void restoreSqlSession().finally(() => {
       setAuthReady(true);
     });
     return () => unsub();
@@ -807,7 +890,7 @@ export default function App() {
   if (!authReady) {
     return (
       <div className="min-h-screen bg-[#F7F8FA] flex items-center justify-center text-sm text-slate-500">
-        Connecting to Kettler MES...
+        Connecting to Manufacturing Execution System...
       </div>
     );
   }

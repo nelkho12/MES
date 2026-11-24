@@ -1,4 +1,4 @@
-import { auth } from '../firebase';
+import { getActiveBearerToken, logoutSqlSession } from './sqlAuthClient';
 import type {
   AuditLogEntry,
   BackwardGenealogyResponse,
@@ -57,11 +57,10 @@ function notifyWorkspaceChanged() {
 }
 
 async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const user = auth.currentUser;
-  if (!user) {
+  const token = await getActiveBearerToken();
+  if (!token) {
     throw new Error('Authentication required. Please sign in again.');
   }
-  const token = await user.getIdToken();
   const headers = new Headers(init.headers);
   headers.set('Authorization', `Bearer ${token}`);
   if (init.body && !headers.has('Content-Type')) {
@@ -72,6 +71,10 @@ async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
     ...init,
     headers,
   });
+
+  if (res.status === 401) {
+    void logoutSqlSession();
+  }
 
   if (!res.ok) {
     let message = `Request failed (${res.status})`;
@@ -89,6 +92,43 @@ async function apiRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 export async function fetchWorkspaceSnapshot(): Promise<WorkspaceSnapshot> {
   return apiRequest<WorkspaceSnapshot>('/api/workspace', { method: 'GET' });
+}
+
+export async function fetchFormulasFromSql(): Promise<FormulaBOM[]> {
+  const res = await apiRequest<{ formulas: FormulaBOM[] }>('/api/formulas', { method: 'GET' });
+  return res.formulas;
+}
+
+export async function fetchRawMaterialsFromSql(): Promise<RawMaterialLot[]> {
+  const res = await apiRequest<{ rawMaterials: RawMaterialLot[] }>('/api/raw-materials', {
+    method: 'GET',
+  });
+  return res.rawMaterials;
+}
+
+export async function fetchBatchesFromSql(): Promise<ProductionBatch[]> {
+  const res = await apiRequest<{ batches: ProductionBatch[] }>('/api/batches', { method: 'GET' });
+  return res.batches;
+}
+
+export async function fetchFinishedGoodsFromSql(): Promise<FinishedGoodLot[]> {
+  const res = await apiRequest<{ finishedGoods: FinishedGoodLot[] }>('/api/finished-goods', {
+    method: 'GET',
+  });
+  return res.finishedGoods;
+}
+
+export async function fetchSensorsFromSql(): Promise<ThermalSensor[]> {
+  const res = await apiRequest<{ sensors: ThermalSensor[] }>('/api/sensors', { method: 'GET' });
+  return res.sensors;
+}
+
+export async function fetchProductionLinesFromSql(): Promise<ProductionLineMachine[]> {
+  const res = await apiRequest<{ productionLines: ProductionLineMachine[] }>(
+    '/api/production-lines',
+    { method: 'GET' }
+  );
+  return res.productionLines;
 }
 
 export async function fetchBatchYieldTrends(

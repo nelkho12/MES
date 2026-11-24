@@ -15,8 +15,8 @@ export default defineConfig(() => {
         includeAssets: ['icon.svg', 'apple-touch-icon.png'],
         manifest: {
           id: '/',
-          name: 'Kettler MES — Food Processing Batch Control',
-          short_name: 'Kettler MES',
+          name: 'Manufacturing Execution System — Food Processing Batch Control',
+          short_name: 'MES',
           description:
             'Standalone food processing manufacturing execution system with lot-tracked inventory, HACCP sensor monitoring, and real-time yield optimization.',
           theme_color: '#0F766E',

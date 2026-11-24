@@ -56,6 +56,7 @@ export const users = pgTable('users', {
   uid: text('uid').primaryKey(),
   email: text('email').notNull(),
   displayName: text('display_name').notNull(),
+  passwordHash: text('password_hash'),
   role: text('role').notNull().default('manager'),
   plantName: text('plant_name')
     .notNull()

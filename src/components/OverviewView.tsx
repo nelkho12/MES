@@ -261,46 +261,53 @@ export function OverviewView({
           </div>
 
           <div className="h-64 mt-4 w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart
-                data={telemetryHistory}
-                margin={{ top: 8, right: 12, left: -12, bottom: 0 }}
-              >
-                <CartesianGrid strokeDasharray="3 3" stroke="#E2E8F0" />
-                <XAxis
-                  dataKey="time"
-                  tick={{ fontSize: 11, fill: '#64748B' }}
-                  axisLine={{ stroke: '#CBD5E1' }}
-                  tickLine={false}
-                />
-                <YAxis
-                  tick={{ fontSize: 11, fill: '#64748B' }}
-                  axisLine={false}
-                  tickLine={false}
-                  domain={['auto', 'auto']}
-                />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: '#FFFFFF',
-                    borderColor: '#CBD5E1',
-                    borderRadius: '6px',
-                    fontSize: '12px',
-                  }}
-                />
-                {hotSensors.map((sensor, idx) => (
-                  <Line
-                    key={sensor.sensorCode}
-                    type="monotone"
-                    dataKey={sensor.sensorCode}
-                    name={`${sensor.sensorCode} (${sensor.name})`}
-                    stroke={LINE_COLORS[idx % LINE_COLORS.length]}
-                    strokeWidth={2}
-                    dot={false}
-                    isAnimationActive={false}
+            {telemetryHistory.length === 0 ? (
+              <div className="h-full flex items-center justify-center text-xs text-slate-500 border border-dashed border-slate-200 rounded-md">
+                No thermal telemetry points recorded in PostgreSQL yet.
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart
+                  data={telemetryHistory}
+                  margin={{ top: 8, right: 12, left: -12, bottom: 0 }}
+                >
+                  <CartesianGrid strokeDasharray="3 3" stroke="#E2E8F0" />
+                  <XAxis
+                    dataKey="time"
+                    tick={{ fontSize: 11, fill: '#64748B' }}
+                    axisLine={{ stroke: '#CBD5E1' }}
+                    tickLine={false}
                   />
-                ))}
-              </LineChart>
-            </ResponsiveContainer>
+                  <YAxis
+                    tick={{ fontSize: 11, fill: '#64748B' }}
+                    axisLine={false}
+                    tickLine={false}
+                    domain={['auto', 'auto']}
+                  />
+                  <Tooltip
+                    contentStyle={{
+                      backgroundColor: '#FFFFFF',
+                      borderColor: '#CBD5E1',
+                      borderRadius: '6px',
+                      fontSize: '12px',
+                    }}
+                  />
+                  {hotSensors.map((sensor, idx) => (
+                    <Line
+                      key={sensor.sensorCode}
+                      type="monotone"
+                      dataKey={sensor.sensorCode}
+                      name={`${sensor.sensorCode} (${sensor.name})`}
+                      stroke={LINE_COLORS[idx % LINE_COLORS.length]}
+                      strokeWidth={2}
+                      dot={telemetryHistory.length <= 3 ? { r: 3 } : false}
+                      connectNulls
+                      isAnimationActive={false}
+                    />
+                  ))}
+                </LineChart>
+              </ResponsiveContainer>
+            )}
           </div>
 
           {/* Cold Chain Summary Strip */}

@@ -1,9 +1,15 @@
 import type { Request, Response, NextFunction } from 'express';
-import type { DecodedIdToken } from 'firebase-admin/auth';
-import { adminAuth } from '../lib/firebase-admin.ts';
+import { verifySqlSessionToken } from '../lib/sqlAuth.ts';
+
+export interface AuthenticatedPrincipal {
+  uid: string;
+  email?: string;
+  name?: string;
+  authProvider: 'sql';
+}
 
 export interface AuthRequest extends Request {
-  user?: DecodedIdToken;
+  user?: AuthenticatedPrincipal;
 }
 
 export const requireAuth = async (
@@ -17,12 +23,16 @@ export const requireAuth = async (
   }
 
   const token = authHeader.split('Bearer ')[1];
-  try {
-    const decodedToken = await adminAuth.verifyIdToken(token);
-    req.user = decodedToken;
-    next();
-  } catch (error) {
-    console.error('Error verifying Firebase ID token:', error);
-    return res.status(401).json({ error: 'Unauthorized: Invalid token' });
+  const sqlPrincipal = verifySqlSessionToken(token);
+  if (!sqlPrincipal) {
+    return res.status(401).json({ error: 'Unauthorized: Invalid or expired session token' });
   }
+
+  req.user = {
+    uid: sqlPrincipal.uid,
+    email: sqlPrincipal.email,
+    name: sqlPrincipal.name,
+    authProvider: 'sql',
+  };
+  next();
 };

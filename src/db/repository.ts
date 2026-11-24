@@ -16,6 +16,35 @@ import {
   users,
 } from './schema.ts';
 import {
+  createAuditLog as createAuditLogSql,
+  createRawMaterial as createRawMaterialSql,
+  createSensor as createSensorSql,
+  deleteProductionLine as deleteProductionLineSql,
+  deleteRawMaterial as deleteRawMaterialSql,
+  deleteSensor as deleteSensorSql,
+  deleteSensorMaintenanceLog as deleteSensorMaintenanceLogSql,
+  getRawMaterialById as getRawMaterialByIdSql,
+  getSensorById as getSensorByIdSql,
+  getUserByUid as getUserByUidSql,
+  listBatchCheckRecordsOrdered,
+  listBatchCheckSpecsOrdered,
+  listBatches as listBatchesSql,
+  listBatchesOrdered,
+  listFinishedGoodsOrdered,
+  listFormulasOrdered,
+  listProductionLinesOrdered,
+  listRawMaterialsOrdered,
+  listRecentAuditLogs,
+  listSensorMaintenanceLogs,
+  listSensorsOrdered,
+  updateProductionLine as updateProductionLineSql,
+  updateRawMaterial as updateRawMaterialSql,
+  updateSensor as updateSensorSql,
+  updateUserByUid as updateUserByUidSql,
+  upsertUser as upsertUserSql,
+  withPgPoolTransaction,
+} from '../services/sqlService.ts';
+import {
   buildDefaultCategoryParameterPresets,
   buildDefaultRecipeProcessParameters,
   buildSeedBatchChecks,
@@ -148,7 +177,7 @@ export async function getActorContextDb(
   email?: string,
   name?: string
 ): Promise<ActorContext> {
-  const [userRow] = await db.select().from(users).where(eq(users.uid, uid));
+  const userRow = await getUserByUidSql(uid);
   return {
     uid,
     email: userRow?.email || email || 'operator@kettler.local',
@@ -174,7 +203,7 @@ async function writeAuditLog(
     reason?: string;
   }
 ): Promise<void> {
-  await executor.insert(auditLogs).values({
+  const values = {
     id: makeSafeId('aud'),
     ownerId: entry.ownerId,
     actorUid: entry.actor.uid,
@@ -188,7 +217,12 @@ async function writeAuditLog(
     oldValue: entry.oldValue ?? null,
     newValue: entry.newValue ?? null,
     reason: (entry.reason || '').trim().slice(0, 500),
-  });
+  };
+  if (executor === db) {
+    await createAuditLogSql(values);
+    return;
+  }
+  await executor.insert(auditLogs).values(values);
 }
 
 function assertClosedBatchEditable(
@@ -224,25 +258,14 @@ export async function getOrCreateUser(
   displayName: string
 ): Promise<UserProfile> {
   try {
-    const result = await db
-      .insert(users)
-      .values({
-        uid,
-        email: email || 'operator@kettler.local',
-        displayName: (displayName || email || 'Plant Operator').slice(0, 100),
-        role: 'manager',
-        plantName: 'Kettler Processing Facility · Plant 01',
-      })
-      .onConflictDoUpdate({
-        target: users.uid,
-        set: {
-          email: email || 'operator@kettler.local',
-          displayName: (displayName || email || 'Plant Operator').slice(0, 100),
-          updatedAt: new Date(),
-        },
-      })
-      .returning();
-    return result[0] as UserProfile;
+    const row = await upsertUserSql({
+      uid,
+      email: email || 'operator@kettler.local',
+      displayName: (displayName || email || 'Plant Operator').slice(0, 100),
+      role: 'manager',
+      plantName: 'Manufacturing Processing Facility · Plant 01',
+    });
+    return row as UserProfile;
   } catch (error) {
     console.error('Failed to synchronize user profile:', error);
     throw new Error('Unable to synchronize user account. Please try again.', { cause: error });
@@ -252,12 +275,8 @@ export async function getOrCreateUser(
 export async function updateUserRoleDb(uid: string, role: UserRole): Promise<UserProfile> {
   try {
     const validRole = normalizeRole(role);
-    const [existing] = await db.select().from(users).where(eq(users.uid, uid));
-    const [updated] = await db
-      .update(users)
-      .set({ role: validRole, updatedAt: new Date() })
-      .where(eq(users.uid, uid))
-      .returning();
+    const existing = await getUserByUidSql(uid);
+    const updated = await updateUserByUidSql(uid, { role: validRole });
     if (existing && updated && existing.role !== validRole) {
       await writeAuditLog(db, {
         ownerId: uid,
@@ -612,7 +631,7 @@ export async function updateWmsConfigDb(
 
 async function seedWorkspaceDb(ownerId: string): Promise<void> {
   const seed = buildSeedWorkspace(ownerId);
-  await db.transaction(async (tx) => {
+  await withPgPoolTransaction(async (_client, tx) => {
     for (const f of seed.formulas) {
       await tx.insert(formulas).values(f).onConflictDoNothing();
     }
@@ -639,19 +658,11 @@ export async function getWorkspaceSnapshot(
   try {
     const profile = await getOrCreateUser(uid, email, displayName);
 
-    let formulaRows = await db
-      .select()
-      .from(formulas)
-      .where(eq(formulas.ownerId, uid))
-      .orderBy(asc(formulas.sku), desc(formulas.version));
+    let formulaRows = await listFormulasOrdered(uid);
 
     if (formulaRows.length === 0) {
       await seedWorkspaceDb(uid);
-      formulaRows = await db
-        .select()
-        .from(formulas)
-        .where(eq(formulas.ownerId, uid))
-        .orderBy(asc(formulas.sku), desc(formulas.version));
+      formulaRows = await listFormulasOrdered(uid);
     }
 
     const [
@@ -665,58 +676,15 @@ export async function getWorkspaceSnapshot(
       initialLineRows,
       auditRows,
     ] = await Promise.all([
-      db
-        .select()
-        .from(rawMaterials)
-        .where(eq(rawMaterials.ownerId, uid))
-        .orderBy(asc(rawMaterials.materialCode)),
-      db
-        .select()
-        .from(batches)
-        .where(eq(batches.ownerId, uid))
-        .orderBy(desc(batches.batchNumber)),
-      db
-        .select()
-        .from(finishedGoods)
-        .where(eq(finishedGoods.ownerId, uid))
-        .orderBy(desc(finishedGoods.productionDate)),
-      db
-        .select()
-        .from(sensors)
-        .where(eq(sensors.ownerId, uid))
-        .orderBy(asc(sensors.sensorCode)),
-      db
-        .select()
-        .from(sensorMaintenanceLogs)
-        .where(eq(sensorMaintenanceLogs.ownerId, uid))
-        .orderBy(
-          desc(sensorMaintenanceLogs.calibrationDate),
-          desc(sensorMaintenanceLogs.createdAt)
-        ),
-      db
-        .select()
-        .from(batchCheckSpecs)
-        .where(eq(batchCheckSpecs.ownerId, uid))
-        .orderBy(desc(batchCheckSpecs.batchNumber)),
-      db
-        .select()
-        .from(batchCheckRecords)
-        .where(eq(batchCheckRecords.ownerId, uid))
-        .orderBy(
-          desc(batchCheckRecords.recordedAt),
-          desc(batchCheckRecords.createdAt)
-        ),
-      db
-        .select()
-        .from(productionLines)
-        .where(eq(productionLines.ownerId, uid))
-        .orderBy(asc(productionLines.lineCode)),
-      db
-        .select()
-        .from(auditLogs)
-        .where(eq(auditLogs.ownerId, uid))
-        .orderBy(desc(auditLogs.createdAt))
-        .limit(500),
+      listRawMaterialsOrdered(uid),
+      listBatchesOrdered(uid),
+      listFinishedGoodsOrdered(uid),
+      listSensorsOrdered(uid),
+      listSensorMaintenanceLogs(uid),
+      listBatchCheckSpecsOrdered(uid),
+      listBatchCheckRecordsOrdered(uid),
+      listProductionLinesOrdered(uid),
+      listRecentAuditLogs(uid, 500),
     ]);
 
     let maintenanceRows = initialMaintenanceRows;
@@ -726,19 +694,12 @@ export async function getWorkspaceSnapshot(
         sensorRows as unknown as ThermalSensor[]
       );
       if (seedLogs.length > 0) {
-        await db.transaction(async (tx) => {
+        await withPgPoolTransaction(async (_client, tx) => {
           for (const log of seedLogs) {
             await tx.insert(sensorMaintenanceLogs).values(log).onConflictDoNothing();
           }
         });
-        maintenanceRows = await db
-          .select()
-          .from(sensorMaintenanceLogs)
-          .where(eq(sensorMaintenanceLogs.ownerId, uid))
-          .orderBy(
-            desc(sensorMaintenanceLogs.calibrationDate),
-            desc(sensorMaintenanceLogs.createdAt)
-          );
+        maintenanceRows = await listSensorMaintenanceLogs(uid);
       }
     }
 
@@ -749,7 +710,7 @@ export async function getWorkspaceSnapshot(
         uid,
         batchRows as unknown as ProductionBatch[]
       );
-      await db.transaction(async (tx) => {
+      await withPgPoolTransaction(async (_client, tx) => {
         for (const spec of seedChecks.specs) {
           await tx.insert(batchCheckSpecs).values(spec).onConflictDoNothing();
         }
@@ -758,35 +719,20 @@ export async function getWorkspaceSnapshot(
         }
       });
       [specRows, checkRows] = await Promise.all([
-        db
-          .select()
-          .from(batchCheckSpecs)
-          .where(eq(batchCheckSpecs.ownerId, uid))
-          .orderBy(desc(batchCheckSpecs.batchNumber)),
-        db
-          .select()
-          .from(batchCheckRecords)
-          .where(eq(batchCheckRecords.ownerId, uid))
-          .orderBy(
-            desc(batchCheckRecords.recordedAt),
-            desc(batchCheckRecords.createdAt)
-          ),
+        listBatchCheckSpecsOrdered(uid),
+        listBatchCheckRecordsOrdered(uid),
       ]);
     }
 
     let lineRows = initialLineRows;
     if (lineRows.length === 0) {
       const seedLines = buildSeedProductionLines(uid);
-      await db.transaction(async (tx) => {
+      await withPgPoolTransaction(async (_client, tx) => {
         for (const line of seedLines) {
           await tx.insert(productionLines).values(line).onConflictDoNothing();
         }
       });
-      lineRows = await db
-        .select()
-        .from(productionLines)
-        .where(eq(productionLines.ownerId, uid))
-        .orderBy(asc(productionLines.lineCode));
+      lineRows = await listProductionLinesOrdered(uid);
     }
 
     const hydratedFormulas = (formulaRows as unknown as FormulaBOM[]).map((f) => ({
@@ -1030,7 +976,7 @@ export async function receiveRawMaterialLotDb(
   const reorder = Math.max(0, Number(input.reorderLevel));
   const status = deriveRawLotStatus(qty, reorder, input.expiryDate);
   try {
-    await db.insert(rawMaterials).values({
+    await createRawMaterialSql({
       id: lotId,
       ownerId,
       lotNumber: input.lotNumber.trim().slice(0, 64),
@@ -1060,18 +1006,15 @@ export async function replenishRawMaterialLotDb(
   addQty: number
 ): Promise<void> {
   try {
-    const [existing] = await db
-      .select()
-      .from(rawMaterials)
-      .where(and(eq(rawMaterials.id, lotId), eq(rawMaterials.ownerId, ownerId)));
+    const existing = await getRawMaterialByIdSql(ownerId, lotId);
     if (!existing) throw new Error('Raw material lot not found.');
 
     const nextQty = Number(Math.max(0, existing.quantityAvailable + addQty).toFixed(3));
     const status = deriveRawLotStatus(nextQty, existing.reorderLevel, existing.expiryDate);
-    await db
-      .update(rawMaterials)
-      .set({ quantityAvailable: nextQty, status, updatedAt: new Date() })
-      .where(and(eq(rawMaterials.id, lotId), eq(rawMaterials.ownerId, ownerId)));
+    await updateRawMaterialSql(ownerId, lotId, {
+      quantityAvailable: nextQty,
+      status,
+    });
   } catch (error) {
     console.error('Failed to replenish raw material lot:', error);
     throw new Error('Unable to replenish stock lot.', { cause: error });
@@ -1093,10 +1036,7 @@ export async function adjustRawMaterialLotDb(
   }
 ): Promise<RawMaterialLot> {
   try {
-    const [existing] = await db
-      .select()
-      .from(rawMaterials)
-      .where(and(eq(rawMaterials.id, lotId), eq(rawMaterials.ownerId, ownerId)));
+    const existing = await getRawMaterialByIdSql(ownerId, lotId);
     if (!existing) throw new Error('Raw material lot not found.');
 
     const qtyInput = Number(input.quantity);
@@ -1139,21 +1079,16 @@ export async function adjustRawMaterialLotDb(
         : existing.storageZone;
 
     const status = deriveRawLotStatus(nextQty, nextReorder, nextExpiry);
-    const [updated] = await db
-      .update(rawMaterials)
-      .set({
-        lotNumber: nextLotNumber,
-        quantityAvailable: nextQty,
-        reorderLevel: nextReorder,
-        unitCost: nextUnitCost,
-        supplier: nextSupplier,
-        expiryDate: nextExpiry,
-        storageZone: nextZone,
-        status,
-        updatedAt: new Date(),
-      })
-      .where(and(eq(rawMaterials.id, lotId), eq(rawMaterials.ownerId, ownerId)))
-      .returning();
+    const updated = await updateRawMaterialSql(ownerId, lotId, {
+      lotNumber: nextLotNumber,
+      quantityAvailable: nextQty,
+      reorderLevel: nextReorder,
+      unitCost: nextUnitCost,
+      supplier: nextSupplier,
+      expiryDate: nextExpiry,
+      storageZone: nextZone,
+      status,
+    });
 
     return updated as unknown as RawMaterialLot;
   } catch (error) {
@@ -1172,19 +1107,10 @@ export async function deleteRawMaterialLotDb(
   lotId: string
 ): Promise<void> {
   try {
-    const [existing] = await db
-      .select()
-      .from(rawMaterials)
-      .where(and(eq(rawMaterials.id, lotId), eq(rawMaterials.ownerId, ownerId)));
+    const existing = await getRawMaterialByIdSql(ownerId, lotId);
     if (!existing) throw new Error('Raw material lot not found.');
 
-    const ownerBatches = await db
-      .select({
-        batchNumber: batches.batchNumber,
-        issuedMaterials: batches.issuedMaterials,
-      })
-      .from(batches)
-      .where(eq(batches.ownerId, ownerId));
+    const ownerBatches = await listBatchesSql(ownerId);
 
     const linkedBatch = ownerBatches.find((b) =>
       (b.issuedMaterials || []).some((m) => m.lotId === lotId)
@@ -1195,9 +1121,7 @@ export async function deleteRawMaterialLotDb(
       );
     }
 
-    await db
-      .delete(rawMaterials)
-      .where(and(eq(rawMaterials.id, lotId), eq(rawMaterials.ownerId, ownerId)));
+    await deleteRawMaterialSql(ownerId, lotId);
   } catch (error) {
     console.error('Failed to delete raw material lot:', error);
     const msg =
@@ -3636,10 +3560,7 @@ export async function updateThermalSensorDb(
   }
 ): Promise<void> {
   try {
-    const [sensor] = await db
-      .select()
-      .from(sensors)
-      .where(and(eq(sensors.id, sensorId), eq(sensors.ownerId, ownerId)));
+    const sensor = await getSensorByIdSql(ownerId, sensorId);
     if (!sensor) throw new Error('Sensor not found.');
 
     const currentTempC = updates.currentTempC ?? sensor.currentTempC;
@@ -3657,19 +3578,15 @@ export async function updateThermalSensorDb(
           ? `Approaching HACCP limit (${currentTempC.toFixed(1)}°C). Trim PID setpoint to prevent yield variance.`
           : `HACCP thermal excursion (${currentTempC.toFixed(1)}°C vs ${minSafeTempC}–${maxSafeTempC}°C safe band). Immediate corrective action required.`);
 
-    await db
-      .update(sensors)
-      .set({
-        currentTempC: Number(currentTempC.toFixed(1)),
-        targetTempC: Number(targetTempC.toFixed(1)),
-        minSafeTempC: Number(minSafeTempC.toFixed(1)),
-        maxSafeTempC: Number(maxSafeTempC.toFixed(1)),
-        humidityPct: Math.max(0, Math.min(100, Math.round(humidityPct))),
-        status,
-        yieldImpactNote: yieldImpactNote.slice(0, 240),
-        updatedAt: new Date(),
-      })
-      .where(and(eq(sensors.id, sensorId), eq(sensors.ownerId, ownerId)));
+    await updateSensorSql(ownerId, sensorId, {
+      currentTempC: Number(currentTempC.toFixed(1)),
+      targetTempC: Number(targetTempC.toFixed(1)),
+      minSafeTempC: Number(minSafeTempC.toFixed(1)),
+      maxSafeTempC: Number(maxSafeTempC.toFixed(1)),
+      humidityPct: Math.max(0, Math.min(100, Math.round(humidityPct))),
+      status,
+      yieldImpactNote: yieldImpactNote.slice(0, 240),
+    });
   } catch (error) {
     console.error('Failed to update thermal sensor:', error);
     throw new Error('Unable to update thermal sensor configuration.', { cause: error });
@@ -3745,24 +3662,16 @@ export async function upsertThermalSensorDb(
     };
 
     if (input.id) {
-      const [updated] = await db
-        .update(sensors)
-        .set({ ...payload, updatedAt: new Date() })
-        .where(and(eq(sensors.id, input.id), eq(sensors.ownerId, ownerId)))
-        .returning();
-      if (!updated) throw new Error('Thermal probe not found.');
+      const updated = await updateSensorSql(ownerId, input.id, payload);
       return updated as unknown as ThermalSensor;
     }
 
     const newId = makeSafeId('sen');
-    const [created] = await db
-      .insert(sensors)
-      .values({
-        id: newId,
-        ownerId,
-        ...payload,
-      })
-      .returning();
+    const created = await createSensorSql({
+      id: newId,
+      ownerId,
+      ...payload,
+    });
     return created as unknown as ThermalSensor;
   } catch (error) {
     console.error('Failed to save thermal probe:', error);
@@ -3780,9 +3689,7 @@ export async function deleteThermalSensorDb(
   sensorId: string
 ): Promise<void> {
   try {
-    await db
-      .delete(sensors)
-      .where(and(eq(sensors.id, sensorId), eq(sensors.ownerId, ownerId)));
+    await deleteSensorSql(ownerId, sensorId);
   } catch (error) {
     console.error('Failed to delete thermal probe:', error);
     throw new Error('Unable to delete thermal probe.', { cause: error });
@@ -4173,22 +4080,7 @@ export async function getSensorMaintenanceLogsDb(
   sensorId?: string
 ): Promise<SensorMaintenanceLog[]> {
   try {
-    const condition = sensorId
-      ? and(
-          eq(sensorMaintenanceLogs.ownerId, ownerId),
-          eq(sensorMaintenanceLogs.sensorId, sensorId)
-        )
-      : eq(sensorMaintenanceLogs.ownerId, ownerId);
-
-    const rows = await db
-      .select()
-      .from(sensorMaintenanceLogs)
-      .where(condition)
-      .orderBy(
-        desc(sensorMaintenanceLogs.calibrationDate),
-        desc(sensorMaintenanceLogs.createdAt)
-      );
-
+    const rows = await listSensorMaintenanceLogs(ownerId, sensorId);
     return rows as unknown as SensorMaintenanceLog[];
   } catch (error) {
     console.error('Failed to query sensor maintenance logs:', error);
@@ -4325,14 +4217,7 @@ export async function deleteSensorMaintenanceLogDb(
   logId: string
 ): Promise<void> {
   try {
-    await db
-      .delete(sensorMaintenanceLogs)
-      .where(
-        and(
-          eq(sensorMaintenanceLogs.id, logId),
-          eq(sensorMaintenanceLogs.ownerId, ownerId)
-        )
-      );
+    await deleteSensorMaintenanceLogSql(ownerId, logId);
   } catch (error) {
     console.error('Failed to delete sensor maintenance log:', error);
     throw new Error('Unable to remove sensor maintenance log.', { cause: error });
@@ -5225,14 +5110,9 @@ export async function updateProductionLineStatusDb(
   try {
     const safeStatus: LineOperationalStatus =
       (status || '').trim().slice(0, 40) || 'Active';
-    const [updated] = await db
-      .update(productionLines)
-      .set({ status: safeStatus, updatedAt: new Date() })
-      .where(
-        and(eq(productionLines.id, lineId), eq(productionLines.ownerId, ownerId))
-      )
-      .returning();
-    if (!updated) throw new Error('Production line / machine not found.');
+    const updated = await updateProductionLineSql(ownerId, lineId, {
+      status: safeStatus,
+    });
     return updated as unknown as ProductionLineMachine;
   } catch (error) {
     console.error('Failed to update production line status:', error);
@@ -5245,11 +5125,7 @@ export async function deleteProductionLineDb(
   lineId: string
 ): Promise<void> {
   try {
-    await db
-      .delete(productionLines)
-      .where(
-        and(eq(productionLines.id, lineId), eq(productionLines.ownerId, ownerId))
-      );
+    await deleteProductionLineSql(ownerId, lineId);
   } catch (error) {
     console.error('Failed to delete production line:', error);
     throw new Error('Unable to remove production line setting.', { cause: error });

@@ -146,8 +146,8 @@ export function generateBatchCompliancePdf(payload: BatchReportPayload): string 
 
   doc.setTextColor(255, 255, 255);
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(14);
-  doc.text('KETTLER MES — BATCH MANUFACTURING & HACCP REPORT', marginX, 12);
+  doc.setFontSize(11.5);
+  doc.text('MANUFACTURING EXECUTION SYSTEM — BATCH MANUFACTURING & HACCP REPORT', marginX, 12);
 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(8.5);
@@ -789,7 +789,7 @@ export function generateBatchCompliancePdf(payload: BatchReportPayload): string 
     doc.setFontSize(7.5);
     doc.setTextColor(100, 116, 139);
     doc.text(
-      `Kettler MES · Controlled HACCP Batch Record (${reportDocId})`,
+      `Manufacturing Execution System · Controlled HACCP Batch Record (${reportDocId})`,
       marginX,
       pageH - 7.5
     );

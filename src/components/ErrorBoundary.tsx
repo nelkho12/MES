@@ -23,7 +23,7 @@ export class ErrorBoundary extends React.Component<
   }
 
   componentDidCatch(error: Error) {
-    console.error('Kettler MES ErrorBoundary caught:', error);
+    console.error('Manufacturing Execution System ErrorBoundary caught:', error);
   }
 
   render() {

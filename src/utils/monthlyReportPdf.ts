@@ -553,8 +553,8 @@ export function buildMonthlyPdfDocument(payload: MonthlyManagementPdfPayload): {
 
   doc.setTextColor(255, 255, 255);
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(13.5);
-  doc.text('KETTLER MES — MONTHLY KPI YIELD & PRODUCTION OUTPUT REPORT', marginX, 11);
+  doc.setFontSize(12);
+  doc.text('MANUFACTURING EXECUTION SYSTEM — MONTHLY KPI YIELD & PRODUCTION OUTPUT REPORT', marginX, 11);
 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(8.2);
@@ -1090,7 +1090,7 @@ export function buildMonthlyPdfDocument(payload: MonthlyManagementPdfPayload): {
     doc.setFontSize(7.2);
     doc.setTextColor(100, 116, 139);
     doc.text(
-      `Kettler MES · Management Review Report (${docRef}) · ${truncateText(filterSummary, 95)}`,
+      `Manufacturing Execution System · Management Review Report (${docRef}) · ${truncateText(filterSummary, 95)}`,
       marginX,
       pageH - 6.8
     );
